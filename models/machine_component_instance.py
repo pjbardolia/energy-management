@@ -39,30 +39,34 @@ class MachineComponentInstance(Base):
     nullable=False
     )
 
-    # Machine ID imported from machine table
+    # FK to machine: which machine this component is physically attached to
     machine_id = Column(
         Integer,
         ForeignKey("machine.id"),
         nullable=False
     )
 
-    # Relationship to machine table
-    # Allows:
-    # component.machine
+    # Multi-tenant isolation: physical component instances belong to one company
+    company_id = Column(
+        Integer,
+        ForeignKey("company.id"),
+        nullable=False
+    )
+
+    # Navigate from this component instance up to the machine it belongs to
     machine = relationship(
         "Machine",
         back_populates="component_instances"
     )
- 
+
+    # Navigate from this component instance to its type definition
     component_type = relationship(
-    "ComponentType",
-    back_populates="component_instances"
+        "ComponentType",
+        back_populates="component_instances"
     )
-    # Relationship to data table
-    # Allows:
-    # component.data_records
-    
+
+    # All telemetry readings produced by this component instance
     telemetry_records = relationship(
-    "TelemetryData",
-    back_populates="component_instance"
+        "TelemetryData",
+        back_populates="component_instance"
     )

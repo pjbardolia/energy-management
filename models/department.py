@@ -45,8 +45,11 @@ class Department(Base):
         back_populates="departments"
     )
 
-    # Relationship to Machine table
-    machine_types = relationship(
-    "MachineType",
-    back_populates="department"
-)
+    # All physical machines located in this department.
+    # Previously this relationship pointed at MachineType (which wrongly carried
+    # department_id).  Now Machine carries department_id directly, so we navigate
+    # department → physical machines instead of department → machine types.
+    machines = relationship(
+        "Machine",
+        back_populates="department"
+    )
