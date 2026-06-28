@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:16          # we'll swap this for TimescaleDB when we implement Decision 1
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"             # optional: lets a desktop DB client connect
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      SECRET_KEY: ${SECRET_KEY}
+    ports:
+      - "8001:8000"             # matches your server, so it's localhost:8001/docs
+    volumes:
+      - .:/app                  # your code edits reload live, no rebuild
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

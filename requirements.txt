@@ -4,3 +4,4 @@ sqlalchemy
 psycopg2-binary
 passlib[bcrypt]
 python-jose[cryptography]
+bcrypt==4.0.1

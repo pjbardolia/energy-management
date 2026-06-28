@@ -32,10 +32,6 @@ class TagDefinition(Base):
         back_populates="tag_definition"
     )
 
-    data_records = relationship(
-        "Data",
-        back_populates="tag_definition"
-    )
     
     telemetry_records = relationship(
     "TelemetryData",

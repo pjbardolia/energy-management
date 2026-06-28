@@ -61,10 +61,6 @@ class MachineComponentInstance(Base):
     # Relationship to data table
     # Allows:
     # component.data_records
-    data_records = relationship(
-        "Data",
-        back_populates="component_instance"
-    )
     
     telemetry_records = relationship(
     "TelemetryData",

@@ -2,7 +2,12 @@ from datetime import datetime, timedelta
 from jose import jwt
 from passlib.context import CryptContext
 
-SECRET_KEY = "my_super_secret_key_change_this_later"
+#SECRET_KEY = "my_super_secret_key_change_this_later"
+
+import os
+SECRET_KEY = os.environ["SECRET_KEY"]
+
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
