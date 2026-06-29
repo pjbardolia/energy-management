@@ -1,10 +1,11 @@
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class MachineTypeCreate(BaseModel):
     # e.g. "Stenter", "Jigger", "Circulation Pump", "Compressor"
-    name: str
+    # min_length=1: reject empty string — a nameless machine type is never useful.
+    name: str = Field(..., min_length=1)
 
     # Optional description of what this machine type does
     description: Optional[str] = None

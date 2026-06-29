@@ -1,5 +1,5 @@
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Import the TagDataType enum from the model layer.
 # Sharing one enum definition prevents the model and API from drifting apart —
@@ -9,7 +9,8 @@ from models.tag_definition import TagDataType
 
 class TagDefinitionCreate(BaseModel):
     # Human-readable measurement name, e.g. "Output Frequency", "DC Bus Voltage"
-    name: str
+    # min_length=1: empty string would produce an un-labelled tag — reject early.
+    name: str = Field(..., min_length=1)
 
     # SI or display unit, e.g. "Hz", "V", "A", "kW" — None is fine for text-type tags
     unit: Optional[str] = None

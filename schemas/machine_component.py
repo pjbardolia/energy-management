@@ -1,9 +1,10 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class MachineComponentCreate(BaseModel):
     # Human name for this physical component, e.g. "Circulation Pump 1"
-    name: str
+    # min_length=1: reject empty string — a blank component name is never valid.
+    name: str = Field(..., min_length=1)
 
     # ID of the component_type row — replaces the old free-text 'component_type' string.
     # Caller must create a ComponentType first (Phase 2 endpoint) and pass its ID.

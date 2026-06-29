@@ -1,10 +1,12 @@
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class MachineCreate(BaseModel):
     # Human name for this physical machine, e.g. "Stenter Line 1"
-    name: str
+    # min_length=1 rejects empty strings — str alone allows "" which would
+    # produce confusingly blank machine names in the database.
+    name: str = Field(..., min_length=1)
 
     # Optional description, e.g. "10-chamber gas stenter, commissioned 2019"
     description: Optional[str] = None

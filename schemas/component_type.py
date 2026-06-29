@@ -1,10 +1,11 @@
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ComponentTypeCreate(BaseModel):
     # e.g. "VFD", "Motor", "Circulation Pump", "Temperature Sensor"
-    name: str
+    # min_length=1: empty string is not a valid type name.
+    name: str = Field(..., min_length=1)
 
     # Optional description of what this component type does
     description: Optional[str] = None

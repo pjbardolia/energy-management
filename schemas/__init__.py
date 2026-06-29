@@ -9,3 +9,4 @@ from .telemetry import *
 from .machine_type import *
 from .component_type import *
 from .tag_definition import *
+from .component_type_tag import *
