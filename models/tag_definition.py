@@ -87,7 +87,12 @@ class TagDefinition(Base):
     )
 
     # All telemetry readings that are filed under this tag
+    # primaryjoin with foreign() is required because TelemetryData.tag_definition_id
+    # has no ForeignKey() declaration (dropped in Phase 4c for TimescaleDB hypertable
+    # compatibility).  foreign() marks that column as the "FK side" of the join so
+    # SQLAlchemy can resolve the relationship without a DB-level constraint.
     telemetry_records = relationship(
         "TelemetryData",
+        primaryjoin="TagDefinition.id == foreign(TelemetryData.tag_definition_id)",
         back_populates="tag_definition"
     )

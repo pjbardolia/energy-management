@@ -66,7 +66,12 @@ class MachineComponentInstance(Base):
     )
 
     # All telemetry readings produced by this component instance
+    # primaryjoin with foreign() is required because TelemetryData.component_instance_id
+    # has no ForeignKey() declaration (dropped in Phase 4c for TimescaleDB hypertable
+    # compatibility).  foreign() marks that column as the "FK side" of the join so
+    # SQLAlchemy can resolve the relationship without a DB-level constraint.
     telemetry_records = relationship(
         "TelemetryData",
+        primaryjoin="MachineComponentInstance.id == foreign(TelemetryData.component_instance_id)",
         back_populates="component_instance"
     )

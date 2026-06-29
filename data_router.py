@@ -47,7 +47,12 @@ def create_data(data: DataCreate, db: Session = Depends(get_db)):
             )
         )
 
-    db.refresh(db_data)
+    # db.refresh() is intentionally omitted here.  TimescaleDB hypertables
+    # reroute every row to an internal chunk table at commit time, which
+    # breaks SQLAlchemy's standard post-commit SELECT-by-PK that refresh()
+    # uses.  All column values were set explicitly before the INSERT, and
+    # SQLAlchemy populates the auto-generated `id` via the INSERT RETURNING
+    # clause, so the instance already holds the complete row for the response.
     return db_data
 
 

@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16          # swapped for timescale/timescaledb-ha:pg16 in Phase 4c
+    image: timescale/timescaledb-ha:pg16
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}

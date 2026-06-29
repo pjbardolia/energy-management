@@ -11,7 +11,17 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
-    bind=engine
+    bind=engine,
+    # expire_on_commit=False prevents SQLAlchemy from expiring all ORM
+    # attributes immediately after db.commit().  The default (True) causes
+    # FastAPI's response serialization to trigger a lazy DB reload for every
+    # attribute — which breaks on the telemetry_data hypertable because
+    # TimescaleDB reroutes rows to internal chunk tables and the reload
+    # SELECT returns no rows (ObjectDeletedError).
+    # With False, committed attributes stay in memory and are readable
+    # directly from the instance without another round-trip.  This is the
+    # pattern recommended by the FastAPI docs for SQLAlchemy integration.
+    expire_on_commit=False,
 )
 
 Base = declarative_base()
