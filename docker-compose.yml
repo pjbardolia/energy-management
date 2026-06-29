@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16          # we'll swap this for TimescaleDB when we implement Decision 1
+    image: postgres:16          # swapped for timescale/timescaledb-ha:pg16 in Phase 4c
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -15,12 +15,29 @@ services:
       timeout: 5s
       retries: 5
 
+  # migrate runs once on startup and exits.  It applies all pending Alembic
+  # migrations before the API server starts.  This replaces Base.metadata.create_all()
+  # in production — Alembic is the single source of truth for schema changes.
+  migrate:
+    build: .
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      SECRET_KEY: ${SECRET_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build: .
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       SECRET_KEY: ${SECRET_KEY}
+      # DEVELOPMENT_MODE=true allows Base.metadata.create_all() to run on startup
+      # as a safety net during local development.  Remove or set to false in production
+      # — Alembic is the only schema manager there.
+      DEVELOPMENT_MODE: "true"
     ports:
       - "8001:8000"             # matches your server, so it's localhost:8001/docs
     volumes:
@@ -28,6 +45,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

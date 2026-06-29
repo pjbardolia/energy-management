@@ -32,17 +32,28 @@ from data_router import router as data_router
 
 from passlib.context import CryptContext
 
-# Create all tables on startup if they don't already exist.
-# Note: create_all cannot ALTER existing columns — use Alembic for schema changes.
-Base.metadata.create_all(bind=engine)
+# create_all() is guarded by DEVELOPMENT_MODE so it only runs locally.
+#
+# In production, Alembic owns the schema — running `alembic upgrade head`
+# (via the `migrate` service in docker-compose.yml) is the only way schema
+# changes are applied.  create_all() cannot ALTER existing columns, so it
+# would silently miss any migration applied after the initial table creation.
+#
+# In local development (DEVELOPMENT_MODE=true in docker-compose.yml),
+# create_all() acts as a fast safety net: if somehow Alembic didn't run, the
+# tables still appear so the API starts.  It is never harmful to run it after
+# Alembic has already created the tables (it is a no-op on existing tables).
+import os
+if os.getenv("DEVELOPMENT_MODE", "").lower() == "true":
+    Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Energy Management API",
     description=(
         "Generic multi-tenant Industrial IoT SaaS platform. "
-        "Phase 2: catalogue + telemetry endpoints fully wired up."
+        "Phase 4b: Alembic migrations introduced; create_all() is dev-only."
     ),
-    version="0.2.0"
+    version="0.4.0"
 )
 
 # Register all routers — order determines Swagger display order
