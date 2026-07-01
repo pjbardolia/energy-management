@@ -4,12 +4,16 @@
 # It belongs to a MachineType (what kind of machine) and a Department
 # (where it physically lives).  Both are FK references — callers must
 # create those rows first and pass their IDs here.
+#
+# Phase 4d changes:
+#   - All endpoints now require a valid JWT (get_tenant_db enforces this).
+#   - GET /machines filters rows by the authenticated user's company_id.
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
-from database import get_db
+from auth import get_current_user, get_tenant_db
 from schemas.machine import MachineCreate, MachineResponse
 from models import Machine
 
@@ -18,7 +22,10 @@ router = APIRouter()
 
 
 @router.post("/machines", response_model=MachineResponse, status_code=201)
-def create_machine(machine: MachineCreate, db: Session = Depends(get_db)):
+def create_machine(
+    machine: MachineCreate,
+    db: Session = Depends(get_tenant_db),
+):
     # Build the ORM row from the validated request body.
     # machine_type_id is a FK to machine_type.id — the model no longer
     # accepts a free-text 'machine_type' string (that caused the 500 error).
@@ -27,7 +34,7 @@ def create_machine(machine: MachineCreate, db: Session = Depends(get_db)):
         machine_type_id=machine.machine_type_id,  # FK, not a string field
         description=machine.description,
         company_id=machine.company_id,
-        department_id=machine.department_id
+        department_id=machine.department_id,
     )
 
     db.add(db_machine)
@@ -43,7 +50,7 @@ def create_machine(machine: MachineCreate, db: Session = Depends(get_db)):
             detail=(
                 "Could not create machine — check that company_id, "
                 "department_id, and machine_type_id all exist."
-            )
+            ),
         )
 
     db.refresh(db_machine)
@@ -51,7 +58,13 @@ def create_machine(machine: MachineCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/machines", response_model=list[MachineResponse])
-def get_machines(db: Session = Depends(get_db)):
-    # Returns every machine row visible in this database.
-    # Phase 3 will add ?company_id= filtering for multi-tenant scoping.
-    return db.query(Machine).all()
+def get_machines(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
+):
+    # WHERE filter scopes results to the authenticated tenant.
+    return (
+        db.query(Machine)
+        .filter(Machine.company_id == current_user["company_id"])
+        .all()
+    )

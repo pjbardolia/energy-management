@@ -8,12 +8,18 @@
 # Sub-resource endpoints on this router:
 #   POST /component-types/{id}/tags  — link one or more TagDefinitions to a ComponentType
 #   GET  /component-types/{id}/tags  — list all TagDefinitions linked to a ComponentType
+#
+# Phase 4d changes:
+#   - All endpoints now require a valid JWT (get_tenant_db enforces this).
+#   - GET /component-types filters by the authenticated user's company_id.
+#   - GET /component-types/{id}/tags filters the junction table by company_id
+#     so tenants cannot read each other's tag links.
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
-from database import get_db
+from auth import get_current_user, get_tenant_db
 from schemas.component_type import ComponentTypeCreate, ComponentTypeResponse
 from schemas.component_type_tag import (
     ComponentTypeTagBatchCreate,
@@ -29,7 +35,10 @@ router = APIRouter()
 # ── Component type CRUD ──────────────────────────────────────────────────────
 
 @router.post("/component-types", response_model=ComponentTypeResponse, status_code=201)
-def create_component_type(component_type: ComponentTypeCreate, db: Session = Depends(get_db)):
+def create_component_type(
+    component_type: ComponentTypeCreate,
+    db: Session = Depends(get_tenant_db),
+):
     db_ct = ComponentType(
         name=component_type.name,
         description=component_type.description,
@@ -54,10 +63,16 @@ def create_component_type(component_type: ComponentTypeCreate, db: Session = Dep
 
 
 @router.get("/component-types", response_model=list[ComponentTypeResponse])
-def get_component_types(db: Session = Depends(get_db)):
-    # Returns every component type across all companies.
-    # Phase 3 will add ?company_id= filtering for multi-tenant scoping.
-    return db.query(ComponentType).all()
+def get_component_types(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
+):
+    # WHERE filter scopes results to the authenticated tenant.
+    return (
+        db.query(ComponentType)
+        .filter(ComponentType.company_id == current_user["company_id"])
+        .all()
+    )
 
 
 # ── Tag-link sub-resources ───────────────────────────────────────────────────
@@ -70,7 +85,7 @@ def get_component_types(db: Session = Depends(get_db)):
 def link_tags_to_component_type(
     component_type_id: int,
     payload: ComponentTypeTagBatchCreate,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_tenant_db),
 ):
     # Verify the parent component type exists before touching junction rows.
     # db.get() is a primary-key lookup — fastest possible read.
@@ -78,7 +93,7 @@ def link_tags_to_component_type(
     if ct is None:
         raise HTTPException(status_code=404, detail="Component type not found.")
 
-    # TODO Phase 4: verify every tag_definition_id in payload.tag_definition_ids
+    # TODO Phase 5: verify every tag_definition_id in payload.tag_definition_ids
     # belongs to payload.company_id (cross-tenant guard).  Without this check a
     # caller could link a tag from a different tenant's catalogue.
 
@@ -140,7 +155,8 @@ def link_tags_to_component_type(
 )
 def get_tags_for_component_type(
     component_type_id: int,
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
 ):
     # Verify the component type exists so callers get a clear 404 rather than
     # an empty list when they pass a wrong ID.
@@ -150,6 +166,10 @@ def get_tags_for_component_type(
 
     return (
         db.query(ComponentTypeTag)
-        .filter(ComponentTypeTag.component_type_id == component_type_id)
+        .filter(
+            ComponentTypeTag.component_type_id == component_type_id,
+            # company_id filter ensures tenants can only read their own links.
+            ComponentTypeTag.company_id == current_user["company_id"],
+        )
         .all()
     )

@@ -19,6 +19,9 @@ from schemas.user import UserCreate, UserResponse
 # Security helpers
 from security import verify_password, create_access_token
 
+# Phase 4d: JWT auth dependency — used to protect GET /companies
+from auth import get_current_user
+
 # Routers — Phase 1 (were working before Phase 2)
 from department_router import router as department_router
 
@@ -51,9 +54,9 @@ app = FastAPI(
     title="Energy Management API",
     description=(
         "Generic multi-tenant Industrial IoT SaaS platform. "
-        "Phase 4b: Alembic migrations introduced; create_all() is dev-only."
+        "Phase 4d: JWT hardening, app-layer tenant filtering, RLS foundation."
     ),
-    version="0.4.0"
+    version="0.4.4"
 )
 
 # Register all routers — order determines Swagger display order
@@ -113,8 +116,16 @@ def create_company(company: CompanyCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/companies", response_model=list[CompanyResponse])
-def get_companies(db: Session = Depends(get_db)):
-    return db.query(Company).all()
+def get_companies(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    # Filter to only the authenticated user's company so tenants never see
+    # each other.  A platform-admin view (all companies) is a future endpoint
+    # that will require a separate admin role.
+    return db.query(Company).filter(
+        Company.id == current_user["company_id"]
+    ).all()
 
 
 # ---------------------------------------------------------------------------
@@ -149,30 +160,22 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/login", response_model=Token)
 def login(data: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(
-        User.username == data.username
-    ).first()
+    # Intentionally use the same 401 message for both "user not found" and
+    # "wrong password" — revealing which one is true would help attackers
+    # enumerate valid usernames.
+    user = db.query(User).filter(User.username == data.username).first()
+    if user is None or not verify_password(data.password, user.password_hash):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password.",
+        )
 
-    if user is None:
-        return {
-            "access_token": "",
-            "token_type": "invalid user"
-        }
+    # Phase 4d: company_id is now embedded in the token so every downstream
+    # dependency can read it without an extra DB round-trip.
+    token = create_access_token({
+        "sub": user.username,
+        "role": user.role,
+        "company_id": user.company_id,   # tenant anchor — validated on every request
+    })
 
-    if not verify_password(data.password, user.password_hash):
-        return {
-            "access_token": "",
-            "token_type": "wrong password"
-        }
-
-    token = create_access_token(
-        {
-            "sub": user.username,
-            "role": user.role
-        }
-    )
-
-    return {
-        "access_token": token,
-        "token_type": "bearer"
-    }
+    return {"access_token": token, "token_type": "bearer"}
