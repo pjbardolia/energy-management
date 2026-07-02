@@ -1,0 +1,6 @@
+# Python packages required by gateway_service.py on the Raspberry Pi.
+# Install with: pip3 install -r requirements_gateway.txt
+
+pymodbus    # Modbus RTU communication (same library used in logger.py)
+pyserial    # Serial port access required by pymodbus for RS485
+requests    # HTTPS POST to the cloud API

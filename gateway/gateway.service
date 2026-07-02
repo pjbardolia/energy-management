@@ -1,0 +1,17 @@
+[Unit]
+Description=Energy Management Gateway Service
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/gateway
+ExecStart=/usr/bin/python3 /home/pi/gateway/gateway_service.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

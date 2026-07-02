@@ -6,3 +6,9 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+
+# Gateway — runtime files and credentials (never commit these)
+gateway/outbox.db
+gateway/gateway.log
+gateway/gateway.log.*
+gateway/config.json

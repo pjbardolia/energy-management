@@ -56,3 +56,10 @@ normalized but the SCHEMAS and ROUTERS were left on the old denormalized shape:
 - Validate inputs on every endpoint.
 - Use SQLAlchemy ORM, PostgreSQL, FastAPI. Keep the multi-company architecture.
 - Keep the current folder structure. Write production-ready code.
+
+## Gateway credentials (Phase 5a)
+Real API credentials and database IDs for the Pi gateway are stored in
+`gateway/config.json` — this file is in `.gitignore` and must NEVER be
+committed. The committed template is `gateway/config.json.example`.
+The runtime SQLite buffer (`gateway/outbox.db`) and log files
+(`gateway/gateway.log*`) are also excluded from git.
