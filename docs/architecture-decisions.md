@@ -153,3 +153,102 @@ for migrations (create_all cannot ALTER existing tables, and cannot create hyper
 
 Follow CLAUDE.md for every change: comment important lines, explain reasoning, provide testing
 AND rollback steps, preserve working behavior, no black-box code.
+
+---
+
+## ADR-005: JWT Hardening and Tenant Isolation Strategy (Phase 4d)
+Date: 2026-07-01
+Status: Implemented
+
+**Decision:** Implement dual-layer tenant isolation — application-layer WHERE filters as
+primary enforcement, PostgreSQL RLS as secondary backstop.
+
+**Details:**
+- JWT tokens now embed `company_id` claim; validated against DB on every request
+- `JWT_SECRET_KEY` must be set via environment variable or startup fails with `RuntimeError`
+  (no silent fallback to a hardcoded default)
+- Tokens expire after 60 minutes; `iat` claim added for audit trail
+- `get_current_user()` dependency validates token + live DB check + `company_id` match on
+  every protected request
+- `get_tenant_db()` dependency sets `SET LOCAL app.current_company_id` before every query
+  (activates RLS policies when a non-superuser app role is introduced)
+- All 7 routers: POST endpoints require JWT, GET endpoints add `company_id` WHERE filter —
+  zero cross-tenant data leakage at application layer
+- Migration 003: RLS ENABLE + FORCE + `tenant_isolation` policy on 7 tables:
+  `department`, `machine`, `machine_type`, `component_type`, `tag_definition`,
+  `component_type_tag`, `machine_component_instance`
+- `telemetry_data` excluded from RLS: TimescaleDB columnstore compression is incompatible
+  with `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`. Application-layer filter in
+  `data_router.py` provides isolation instead.
+- RLS policies are inactive until a non-superuser app role is created (app currently connects
+  as PostgreSQL superuser which bypasses RLS unconditionally). Full RLS activation deferred
+  to Phase 5b.
+
+---
+
+## ADR-006: Edge-to-Cloud Transport — HTTPS-first, MQTT deferred
+Date: 2026-07-02
+Status: Decided, implementation pending
+
+**Decision:** Phase 5a uses direct HTTPS POST from Raspberry Pi gateway to the existing
+FastAPI `/data` endpoint. MQTT is deferred to Phase 5b.
+
+**Context:**
+- Hardware confirmed working: Raspberry Pi 3B+ with Waveshare USB-to-4CH RS485/422
+  converter, INVT CHF100A VFD on Port 1 (`/dev/ttyUSB0`), Modbus RTU at 9600 baud,
+  8N1, Slave ID 1
+- 8 registers read from address 0x3000: frequency, ref_freq, dc_voltage, output_voltage,
+  current, rpm, power, torque
+- Working code: `gateway/logger.py` (polls every 10 s, writes to CSV)
+- Static IP: 192.168.0.200 on office LAN
+
+**Rationale for HTTPS-first:**
+- The `/data` endpoint with JWT auth is already built and tested (Phase 4d)
+- At current scale (1 VFD, 1 factory), MQTT decoupling benefits are theoretical while
+  its costs are immediate: new broker infrastructure, separate auth/ACL model, async
+  debugging complexity
+- HTTPS-first creates a complete, fully-understood end-to-end pipeline on primitives
+  already proven and visible end-to-end
+- MQTT to be introduced in Phase 5b as an isolated, well-scoped enhancement when scale
+  demands it
+
+**Deliberate deviation from handbook:** Volumes 02, 06, 07 specify MQTT as primary
+transport. This is a sequencing decision, not an architectural rejection. The `/data`
+endpoint and TimescaleDB schema are MQTT-compatible and will not require changes when
+MQTT is introduced.
+
+**Phase 5a gateway architecture:**
+
+```
+Modbus Poller → SQLite outbox buffer → HTTPS Forwarder → POST /data
+```
+
+- SQLite buffer: store-and-forward for network outages
+- JWT token management: auto-login, cache token, re-login on 401
+- Runs as systemd service on Pi (start on boot, restart on crash)
+- Config-driven: all parameters in `config.json`, no hardcoded values
+
+---
+
+## ADR-007: Edge Gateway Hardware — Raspberry Pi 3B+
+Date: 2026-07-02
+Status: Confirmed working
+
+**Decision:** Raspberry Pi 3B+ as the sole edge gateway device.
+
+**Rationale:**
+- Full Linux: Python, SQLite buffering, systemd, SSH debugging, OTA updates
+- One Pi manages 4 independent RS485 buses via Waveshare 4-CH USB adapter
+- Operational advantage of SSH access vs physical hardware access in factory environment
+  is decisive at current scale
+- Same Python codebase as backend: one developer can maintain entire stack
+- Rejected alternative: ESP32 nodes — insufficient local storage for buffering, no Linux,
+  painful OTA, single RS485 bus per device
+
+**Hardware panel (assembled, confirmed working):**
+- Selec RPS240-24-CE: 240 W DIN rail 24 V DC PSU (AC → 24 V)
+- Meanwell DDR-30G-5: DC-DC converter (24 V → 5 V, 6 A) for Pi power
+- WAGO 852-111: 5-port 10/100 industrial Ethernet switch (24 V powered)
+- Waveshare USB-to-4CH RS485/422: 4 independent RS485 buses via USB
+- Schneider xC60 A9N2P06CGN: 2-pole 6 A MCB (AC input protection)
+- Raspberry Pi 3B+: static IP 192.168.0.200 on office LAN 192.168.0.x

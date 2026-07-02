@@ -22,16 +22,14 @@ from security import verify_password, create_access_token
 # Phase 4d: JWT auth dependency — used to protect GET /companies
 from auth import get_current_user
 
-# Routers — Phase 1 (were working before Phase 2)
-from department_router import router as department_router
-
-# Routers — Phase 2 (fixed or newly created)
-from machine_type_router import router as machine_type_router
-from machine_router import router as machine_router
-from component_type_router import router as component_type_router
-from machine_component_router import router as machine_component_router
-from tag_definition_router import router as tag_definition_router
-from data_router import router as data_router
+# Routers — all now live in the routers/ package
+from routers.department_router import router as department_router
+from routers.machine_type_router import router as machine_type_router
+from routers.machine_router import router as machine_router
+from routers.component_type_router import router as component_type_router
+from routers.machine_component_router import router as machine_component_router
+from routers.tag_definition_router import router as tag_definition_router
+from routers.data_router import router as data_router
 
 from passlib.context import CryptContext
 
