@@ -38,6 +38,7 @@ from datetime import datetime, timedelta
 
 import requests
 from pymodbus.client import ModbusSerialClient
+from pymodbus.exceptions import ModbusIOException
 
 
 # ---------------------------------------------------------------------------
@@ -446,17 +447,33 @@ def read_modbus(client: ModbusSerialClient, slave_id: int) -> dict | None:
     the two scripts produce identical numeric values.
 
     Returns:
-        dict mapping register_name → float value, or None on Modbus error.
-        The caller should skip the poll cycle and not write to outbox on None.
+        dict mapping register_name → float value, or None on any Modbus error.
+        None signals the caller to skip this poll cycle without writing to outbox.
+
+    Error handling:
+        ModbusIOException is caught here and logged as WARNING — it is a normal
+        transient condition (CRC error, timeout, VFD powered off) that does not
+        warrant a full traceback.  The generic isError() check below catches any
+        other Modbus error type that pymodbus returns as an error response object
+        rather than raising an exception.
     """
-    rr = client.read_holding_registers(
-        address=0x3000,
-        count=8,
-        device_id=slave_id,
-    )
+    try:
+        rr = client.read_holding_registers(
+            address=0x3000,
+            count=8,
+            device_id=slave_id,
+        )
+    except ModbusIOException as exc:
+        # ModbusIOException covers serial-level failures: CRC mismatch, no
+        # response within timeout, framing errors.  Log as WARNING (not ERROR)
+        # because one bad read is expected occasionally and not actionable.
+        log.warning("Modbus read failed: %s", exc)
+        return None
 
     if rr.isError():
-        log.warning("Modbus read error from slave %d: %s", slave_id, rr)
+        # pymodbus can also signal errors by returning an error response object
+        # instead of raising — this guard catches those cases.
+        log.warning("Modbus error response from slave %d: %s", slave_id, rr)
         return None
 
     values = {}
@@ -530,6 +547,14 @@ def run(config: dict):
 
     log.info("Modbus connected on %s", modbus_port)
 
+    # Consecutive-failure counter — reset to 0 after every successful Modbus read.
+    # If 5 failures occur back-to-back without a single success in between, the
+    # process exits so systemd can restart it with a clean state.
+    # This catches permanent failure modes (e.g. pymodbus internal state corruption)
+    # that the OSError/errno-5 guard below doesn't cover.
+    _MAX_CONSECUTIVE_FAILURES = 5
+    _consecutive_failures = 0
+
     while True:
         try:
             # ── Step 1: Read Modbus registers ───────────────────────────
@@ -538,9 +563,14 @@ def run(config: dict):
             if values is None:
                 # Modbus read failed — skip this cycle.
                 # Do NOT write to outbox: we have no valid data.
-                log.warning("Modbus read failed — skipping poll cycle")
+                # A failed read does not count as a consecutive failure because
+                # read_modbus() already handles ModbusIOException gracefully.
+                log.warning("Modbus read returned None — skipping poll cycle")
                 time.sleep(poll_interval)
                 continue
+
+            # Successful read — reset the consecutive-failure counter.
+            _consecutive_failures = 0
 
             # Timestamp in the format the /data endpoint expects.
             timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
@@ -580,11 +610,44 @@ def run(config: dict):
             # ── Step 3: Forward outbox to cloud ─────────────────────────
             forward_outbox(token_manager, api_base_url)
 
-        except Exception:
-            # Unexpected error (bug, not a handled condition).
-            # Log full traceback, sleep 30 s, then resume the loop.
+        except Exception as exc:
+            _consecutive_failures += 1
+
+            # ── Check for USB serial device loss (errno 5: Input/output error) ──
+            # OSError with errno 5 means the USB device was physically unplugged
+            # or the kernel dropped the serial device node.  The ModbusSerialClient
+            # file handle is now dead — sleeping and retrying in this process would
+            # loop forever on the same dead handle.  Exit immediately so systemd
+            # restarts the process (Restart=always, RestartSec=10) with a fresh
+            # handle after the adapter is re-plugged.
+            if isinstance(exc, OSError) and exc.errno == 5:
+                log.critical(
+                    "Serial device lost (errno 5: I/O error) — "
+                    "exiting for systemd restart"
+                )
+                raise SystemExit(1)
+
+            # ── Check consecutive-failure threshold ──────────────────────────────
+            # Any other unhandled exception (bug, pymodbus state corruption, etc.)
+            # increments the counter.  Five in a row without a successful poll
+            # means we are stuck — exit so systemd can restart cleanly.
+            if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                log.critical(
+                    "%d consecutive unhandled exceptions — "
+                    "exiting for systemd restart.  Last error:\n%s",
+                    _consecutive_failures,
+                    traceback.format_exc(),
+                )
+                raise SystemExit(1)
+
+            # ── Recoverable unexpected error ─────────────────────────────────────
+            # Log the full traceback for diagnosis, sleep 30 s, then resume.
             log.error(
-                "Unexpected error in poll loop:\n%s", traceback.format_exc()
+                "Unexpected error in poll loop "
+                "(failure %d/%d before forced restart):\n%s",
+                _consecutive_failures,
+                _MAX_CONSECUTIVE_FAILURES,
+                traceback.format_exc(),
             )
             time.sleep(30)
             continue
