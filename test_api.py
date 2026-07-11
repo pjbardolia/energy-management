@@ -449,6 +449,54 @@ for path in ["/companies", "/departments", "/machines", "/machine-components", "
     count = len(parsed) if isinstance(parsed, list) else "?"
     record("GET " + path, status, status == 200, "rows=" + str(count))
 
+# 35) GET /machines/live — fleet live view ----------------------------------
+status, raw, parsed = request("GET", "/machines/live", token=token)
+live_ok = (
+    status == 200
+    and isinstance(parsed, list)
+    and (not parsed or ("tags" in parsed[0] and "machine_id" in parsed[0]))
+)
+record("GET /machines/live", status, live_ok,
+       "machines={}".format(len(parsed) if isinstance(parsed, list) else "?"))
+
+# 36) GET /machines/{id}/live — single machine live view --------------------
+# Uses machine_id from step 27.  404 acceptable if machine has no telemetry yet.
+if machine_id:
+    status, raw, parsed = request(
+        "GET", "/machines/{}/live".format(machine_id), token=token)
+    single_ok = status in (200, 404) and (
+        status == 404 or "tags" in (parsed or {}))
+    record("GET /machines/{}/live".format(machine_id), status, single_ok, raw[:90])
+else:
+    record("GET /machines/{id}/live", None, False, "skipped: no machine_id")
+
+# 37) GET /machines/{id}/history — time-bucketed history --------------------
+# 404 acceptable if the machine has no telemetry yet.
+if machine_id:
+    status, raw, parsed = request(
+        "GET", "/machines/{}/history?hours=1".format(machine_id), token=token)
+    hist_ok = status in (200, 404) and (
+        status == 404 or (
+            "data" in (parsed or {}) and "machine_id" in (parsed or {})))
+    record("GET /machines/{}/history".format(machine_id), status, hist_ok, raw[:90])
+else:
+    record("GET /machines/{id}/history", None, False, "skipped: no machine_id")
+
+# 38) GET /fleet/summary — aggregated fleet KPIs ----------------------------
+status, raw, parsed = request("GET", "/fleet/summary", token=token)
+summary_ok = (
+    status == 200
+    and isinstance(parsed, dict)
+    and "total_machines" in (parsed or {})
+    and "running" in (parsed or {})
+    and "total_power_kw" in (parsed or {})
+)
+record("GET /fleet/summary", status, summary_ok,
+       "total={} running={}".format(
+           (parsed or {}).get("total_machines", "?"),
+           (parsed or {}).get("running", "?"),
+       ))
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
