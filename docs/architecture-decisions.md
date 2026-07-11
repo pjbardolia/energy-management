@@ -252,3 +252,53 @@ Status: Confirmed working
 - Waveshare USB-to-4CH RS485/422: 4 independent RS485 buses via USB
 - Schneider xC60 A9N2P06CGN: 2-pole 6 A MCB (AC input protection)
 - Raspberry Pi 3B+: static IP 192.168.0.200 on office LAN 192.168.0.x
+
+---
+
+## ADR-008: Frontend — Vite + React SPA with mock data (Phase 5b)
+Date: 2026-07-11
+Status: Accepted
+
+**Decision:** Build the operator dashboard as a single-page React application in `frontend/`
+using Vite as the build tool. All data in Phase 5b is generated locally by mock functions
+(`buildFleet`, `buildHistory`). Real API wiring is deferred to Phase 5c.
+
+**Tech choices and rationale:**
+
+- **Vite over Create React App:** Vite's dev server starts in <300 ms (CRA takes 5–10 s on
+  first build); HMR is near-instant. CRA is deprecated upstream. No reason to choose it.
+
+- **React over Vue/Svelte/plain JS:** Team already writes Python; React's explicit state
+  model (`useState`, `useEffect`) maps more directly to imperative mental models than
+  Vue's reactivity magic. A plain-JS dashboard would require hand-rolling a component
+  abstraction as complexity grows.
+
+- **Recharts for charts:** Pure React, no canvas, no separate charting instance to manage.
+  D3 was considered and rejected — the API complexity exceeds the customisation benefit
+  for standard area/line charts.
+
+- **No TypeScript at this stage:** Adding a type layer before the API shape is finalised
+  would create churn. TypeScript migration is straightforward once Phase 5c stabilises
+  the data contracts.
+
+- **No router library:** Three views (login → fleet → detail) are managed with a single
+  `page` state variable in `App.jsx`. Adding React Router for three states would be
+  over-engineering.
+
+**Dev proxy:** `vite.config.js` proxies `GET|POST /api/*` to `http://165.22.247.235:8001`
+(stripping the `/api` prefix) so `npm run dev` can reach the live API without CORS issues.
+In production, `API_BASE` reverts to the direct server URL via `import.meta.env.DEV`.
+
+**Mock data (Phase 5b):** `buildFleet()` and `buildHistory()` generate realistic sinusoidal
+data locally. Both functions carry a `TODO Phase 5c` comment marking the exact lines to
+replace with `fetch()` calls when `GET /machines/live` and `GET /machines/{id}/history`
+are implemented on the backend.
+
+**To start the dev server:**
+```bash
+cd frontend
+npm install
+npm run dev   # → http://localhost:5173
+```
+Login with `demo@mevion.com` / `demo` for mock preview, or real SSPPL credentials
+to hit the live API via the Vite proxy.

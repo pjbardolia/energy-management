@@ -12,3 +12,6 @@ gateway/outbox.db
 gateway/gateway.log
 gateway/gateway.log.*
 gateway/config.json
+
+# Frontend — build output and installed packages
+frontend/node_modules/
