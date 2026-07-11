@@ -35,13 +35,13 @@ class FleetSummaryResponse(BaseModel):
     # Total number of distinct machines that have sent telemetry
     total_machines: int
 
-    # Machines where the most-recent frequency reading (tag_id=6) is > 0
+    # Machines where the most-recent "frequency" tag reading is > 0
     running: int
 
     # total_machines - running
     stopped: int
 
-    # Sum of the most-recent power reading (tag_id=7) across all components
+    # Sum of the most-recent "power" tag reading across all components
     total_power_kw: float
 
     # Timestamp of the most recent reading across the entire fleet
@@ -64,15 +64,11 @@ class HistoryBucketResponse(BaseModel):
     # (1 min for ≤1 h, 5 min for ≤6 h, 15 min for ≤24 h)
     bucket: datetime
 
-    # All seven VFD tag values as averages within the bucket.
-    # None when no reading of that type arrived in the bucket period.
-    frequency:      Optional[float] = None   # tag_definition_id = 6  Hz
-    current:        Optional[float] = None   # tag_definition_id = 3  A
-    power:          Optional[float] = None   # tag_definition_id = 7  kW
-    rpm:            Optional[float] = None   # tag_definition_id = 1  RPM
-    torque:         Optional[float] = None   # tag_definition_id = 2  %
-    output_voltage: Optional[float] = None   # tag_definition_id = 5  V
-    dc_voltage:     Optional[float] = None   # tag_definition_id = 4  V
+    # All available tag values averaged within the bucket, keyed by tag slug.
+    # Symmetric with the live endpoint's tags dict — frontend renders both the
+    # same way.  Tags with no readings in the bucket are omitted from the dict.
+    # Example: {"frequency": 30.5, "power": 22.1, "current": 6.2}
+    tags: dict[str, Optional[float]]
 
     class Config:
         from_attributes = True

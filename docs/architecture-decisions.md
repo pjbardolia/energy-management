@@ -302,3 +302,75 @@ npm run dev   # → http://localhost:5173
 ```
 Login with `demo@mevion.com` / `demo` for mock preview, or real SSPPL credentials
 to hit the live API via the Vite proxy.
+
+---
+
+## ADR-009: Telemetry Read API Shape (Phase 5c)
+Date: 2026-07-11
+Status: Implemented
+
+**Decision:** Both `/machines/live` and `/machines/{id}/history` return a `tags`
+dict keyed by slug.  The live endpoint returns `{"machine_id": …, "tags": {"frequency": 30.5, …}}`.
+The history endpoint returns `{"data": [{"bucket": …, "tags": {"frequency": 30.5, …}}, …]}`.
+The two shapes are symmetric — frontend code that iterates `tags` for the live view can reuse
+the same logic for history chart data.
+
+**Implementation:**
+- Live: `_get_latest_rows()` + `_pivot_rows()` in `routers/telemetry_read.py`.
+  DISTINCT ON gives the most-recent reading per (component, tag); Python pivots into
+  one dict per machine.
+- History: long-form SQL (`one row per (bucket, tag_key)`) + Python pivot.
+  No hardcoded tag IDs in SQL; JOIN to `tag_definition` provides the slug key.
+  Time-bucket sizes: 1 min (≤1 h), 5 min (≤6 h), 15 min (≤24 h).
+
+**Alternatives considered:**
+- 7 fixed named columns on `HistoryBucketResponse` (e.g. `frequency`, `power`, `rpm`).
+  Rejected: schema breaks when a new tag is added or a tag is renamed; frontend
+  must be updated in lockstep with every tag catalogue change.
+- Conditional aggregation (`AVG(CASE WHEN tag_definition_id = 6 THEN …)`) with
+  tenant-resolved IDs looked up first.  Rejected: requires dynamic SQL construction
+  and couples the query to a first-pass ID lookup; long-form + pivot is simpler and
+  equally performant for ≤100 tag types per machine.
+
+---
+
+## ADR-010: Tag Key Slugs (Phase 5c)
+Date: 2026-07-11
+Status: Implemented
+
+**Decision:** `tag_definition.key` is the stable, machine-readable API contract between
+the backend, gateways, and frontends.  `tag_definition.name` is the human-editable
+display label that operators may change at any time.
+
+**Contract slugs for the seven SSPPL VFD tags (pinned, never change):**
+
+| key | name (display) | unit |
+|---|---|---|
+| rpm | Rotation Speed | RPM |
+| torque | Output Torque | % |
+| current | Output Current | A |
+| dc_voltage | DC Bus Voltage | V |
+| output_voltage | Output Voltage | V |
+| frequency | Output Frequency | Hz |
+| power | Output Power | kW |
+
+**Constraints:**
+- `key` must match `^[a-z][a-z0-9_]*$` (validated in `TagDefinitionCreate`).
+- Unique per company: `(company_id, key)` unique index added in migration 004.
+- Two tenants may independently define a "frequency" tag with different database IDs.
+- `key` is written once on creation and treated as immutable after the first
+  telemetry row references the tag.  Changing a key after data exists would break
+  all existing dashboard charts and gateway polling without a coordinated migration.
+
+**Motivation:**
+The production incident that motivated this ADR: `_pivot_rows()` was keying the
+`tags` dict by `tdef.name` ("Output Frequency") instead of `tdef.key` ("frequency").
+Fleet summary was additionally using hardcoded integer `tag_definition_id` values
+(6 = frequency, 7 = power) that were specific to company 1.  Both bugs caused silent
+failures for any second tenant and would have broken SSPPL the moment an operator
+renamed a tag.
+
+**Backfill:** migration 004 maps existing `name` values to `key` slugs using an
+explicit CASE statement.  The seven gateway-contract names are all in the list.
+The ELSE branch applies `lower(replace(name, ' ', '_'))` as a fallback for any
+operator-defined tags not in the mapping.

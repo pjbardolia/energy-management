@@ -12,6 +12,12 @@ class TagDefinitionCreate(BaseModel):
     # min_length=1: empty string would produce an un-labelled tag — reject early.
     name: str = Field(..., min_length=1)
 
+    # Machine-readable slug — the stable contract with gateways and frontends.
+    # Must be lowercase letters, digits, or underscores, starting with a letter.
+    # Examples: "frequency", "dc_voltage", "output_voltage"
+    # Must be unique within the company; validated by migration 004 DB constraint.
+    key: str = Field(..., min_length=1, pattern=r'^[a-z][a-z0-9_]*$')
+
     # SI or display unit, e.g. "Hz", "V", "A", "kW" — None is fine for text-type tags
     unit: Optional[str] = None
 
@@ -30,6 +36,7 @@ class TagDefinitionCreate(BaseModel):
 class TagDefinitionResponse(BaseModel):
     id: int
     name: str
+    key: str
     unit: Optional[str] = None
     description: Optional[str] = None
     data_type: TagDataType

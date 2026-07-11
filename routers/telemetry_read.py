@@ -1,9 +1,9 @@
 # Read-oriented telemetry endpoints for the dashboard frontend.
 #
-# Three endpoints live here:
+# Four endpoints live here:
 #
 #   GET /machines/live
-#       Most-recent readings for every machine, pivoted by tag_name into a
+#       Most-recent readings for every machine, pivoted by tag_key slug into a
 #       tags dict.  Ready for the fleet dashboard to render without further
 #       client-side aggregation.  Used to replace buildFleet() in Phase 5c.
 #
@@ -13,13 +13,13 @@
 #   GET /fleet/summary
 #       Derived from the same DISTINCT ON query as /machines/live.
 #       Returns total/running/stopped machine counts and total power in kW.
-#       Used to replace the KPI bar in FleetDashboard in Phase 5c.
+#       Identification by tag_key slug ("frequency", "power") — not by integer
+#       tag_definition_id, so it works correctly for every tenant.
 #
 #   GET /machines/{machine_id}/history
-#       All seven tag values per time bucket for one machine over a requested
-#       window (1–24 hours).  Uses TimescaleDB time_bucket() with conditional
-#       aggregation — one row per time step.
-#       Used to replace buildHistory() in Phase 5c.
+#       Long-form SQL (one row per bucket + tag_key) followed by Python pivot.
+#       The pivot produces {"bucket": ..., "tags": {"frequency": 30.5, ...}}
+#       per time step — symmetric with the live endpoint.  No hardcoded tag IDs.
 #
 # Write endpoint (POST /data) stays in data_router.py — not touched here.
 
@@ -49,7 +49,11 @@ def _get_latest_rows(db: Session, company_id: int) -> list:
     """Return the most-recent reading per (component, tag) for one tenant.
 
     Uses PostgreSQL DISTINCT ON with three JOINs to attach machine_name and
-    tag_name to each row so callers don't need additional queries.
+    tag_key to each row so callers don't need additional queries.
+
+    tag_key is the stable slug from tag_definition.key ("frequency", "power",
+    …) — not the human-editable display name.  Callers use it as the key in
+    the tags dict so frontend/gateway contracts are unaffected by name changes.
 
     The query is fully parameterised — company_id is bound, never interpolated.
 
@@ -65,7 +69,7 @@ def _get_latest_rows(db: Session, company_id: int) -> list:
             td.timestamp,
             m.id          AS machine_id,
             m.name        AS machine_name,
-            tdef.name     AS tag_name
+            tdef.key      AS tag_key
         FROM telemetry_data td
         JOIN machine_component_instance mci
           ON mci.id = td.component_instance_id
@@ -88,11 +92,12 @@ def _get_latest_rows(db: Session, company_id: int) -> list:
 
 
 def _pivot_rows(rows) -> list[dict]:
-    """Group flat tag rows by machine_id, pivot tag_name → value_num into tags dict.
+    """Group flat tag rows by machine_id, pivot tag_key → value_num into tags dict.
 
     Input: list of RowMapping objects from _get_latest_rows() — one row per
-           (component, tag) combination, with machine_id and tag_name attached.
-    Output: one dict per machine with all its latest tag values in a 'tags' sub-dict.
+           (component, tag) combination, with machine_id and tag_key attached.
+    Output: one dict per machine with all its latest tag values in a 'tags' sub-dict,
+            keyed by tag slug (e.g. {"frequency": 30.5, "power": 22.1}).
     """
     machines: dict[int, dict] = {}
     for row in rows:
@@ -105,7 +110,8 @@ def _pivot_rows(rows) -> list[dict]:
                 "last_updated":          row["timestamp"],
                 "tags":                  {},
             }
-        machines[mid]["tags"][row["tag_name"]] = row["value_num"]
+        # Key by slug, not display name — stable across operator renames
+        machines[mid]["tags"][row["tag_key"]] = row["value_num"]
         # Keep last_updated as the most-recent timestamp across all tags
         if row["timestamp"] > machines[mid]["last_updated"]:
             machines[mid]["last_updated"] = row["timestamp"]
@@ -121,10 +127,10 @@ def get_machines_live(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_tenant_db),
 ):
-    """Return the most-recent readings for every machine, pivoted by tag name.
+    """Return the most-recent readings for every machine, pivoted by tag slug.
 
     Each machine appears once; all its latest tag values are collapsed into a
-    single tags dict keyed by tag_name (e.g. {"frequency": 30.5, "power": 22.1}).
+    single tags dict keyed by slug (e.g. {"frequency": 30.5, "power": 22.1}).
     Phase 5c: replace buildFleet() in App.jsx with a fetch to this endpoint.
     """
     rows = _get_latest_rows(db, current_user["company_id"])
@@ -141,7 +147,7 @@ def get_machine_live(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_tenant_db),
 ):
-    """Return the most-recent readings for a single machine, pivoted by tag name.
+    """Return the most-recent readings for a single machine, pivoted by tag slug.
 
     Reuses the fleet-wide DISTINCT ON query and filters in Python — avoids a
     separate per-machine query when the fleet data is already cached.
@@ -170,11 +176,13 @@ def get_fleet_summary(
 
     Derivation logic:
     - total_machines : count of distinct machine_id values in the rows
-    - running        : machines that have a frequency row (tag_id 6) with value_num > 0
+    - running        : machines with a "frequency" tag reading > 0
     - stopped        : total_machines - running
-    - total_power_kw : sum of value_num across all power rows (tag_id 7)
+    - total_power_kw : sum of "power" tag readings across all components
     - last_updated   : max timestamp across all rows
 
+    Tag identification uses tag_key slugs, not hardcoded integer IDs, so this
+    works correctly for every tenant regardless of their tag_definition IDs.
     Phase 5c: replace the KPI bar in FleetDashboard with a fetch to this endpoint.
     """
     rows = _get_latest_rows(db, current_user["company_id"])
@@ -203,16 +211,15 @@ def get_fleet_summary(
         if max_ts is None or row["timestamp"] > max_ts:
             max_ts = row["timestamp"]
 
-        tag_id = row["tag_definition_id"]
+        tag_key = row["tag_key"]
 
-        # tag_definition_id 6 = frequency (Hz)
-        if tag_id == 6 and row["value_num"] is not None:
-            machine_id = row["machine_id"]
-            existing = freq_by_machine.get(machine_id, 0.0)
-            freq_by_machine[machine_id] = max(existing, row["value_num"])
+        # "frequency" slug → Hz reading; > 0 means the reel motor is running
+        if tag_key == "frequency" and row["value_num"] is not None:
+            mid = row["machine_id"]
+            freq_by_machine[mid] = max(freq_by_machine.get(mid, 0.0), row["value_num"])
 
-        # tag_definition_id 7 = power (kW)
-        if tag_id == 7 and row["value_num"] is not None:
+        # "power" slug → kW reading; sum across all machines/components
+        if tag_key == "power" and row["value_num"] is not None:
             power_total += row["value_num"]
 
     total_machines = len(freq_by_machine)
@@ -265,8 +272,10 @@ def get_history(
 ):
     """Return bucketed time-series data for one machine over a recent window.
 
-    All seven tag values are returned per time bucket in a single query using
-    conditional aggregation — one row per time step instead of seven calls.
+    Uses a long-form SQL query (one row per bucket + tag combination) and a
+    Python-side pivot.  This approach requires no hardcoded tag IDs — it works
+    for any tenant's tag catalogue because the JOIN to tag_definition gives us
+    the slug key, not an integer ID.
 
     Path param:
         machine_id — the machine.id to query.
@@ -276,15 +285,13 @@ def get_history(
 
     Ownership check:
         machine_component_instance is queried for a row matching both machine_id
-        and company_id, resolving to the component_instance_id used in telemetry.
-        A valid machine_id belonging to a different tenant returns 404.
+        and company_id.  A valid machine_id belonging to a different tenant
+        returns 404, not leaking the fact that the ID exists.
 
     Phase 5c: replace buildHistory() in App.jsx with a fetch to this endpoint.
     """
     # --- Resolve machine_id → component_instance_id (ownership check included) ---
-    # company_id filter means a valid machine_id from another tenant returns 404,
-    # not leaking the fact that the ID exists.
-    row = db.execute(
+    ci_row = db.execute(
         text(
             "SELECT id FROM machine_component_instance "
             "WHERE machine_id = :machine_id AND company_id = :company_id"
@@ -292,42 +299,36 @@ def get_history(
         {"machine_id": machine_id, "company_id": current_user["company_id"]},
     ).fetchone()
 
-    if row is None:
+    if ci_row is None:
         raise HTTPException(
             status_code=404,
             detail="Machine {} not found.".format(machine_id),
         )
 
-    cid = row[0]   # the component_instance_id stored in telemetry_data
+    cid = ci_row[0]   # the component_instance_id stored in telemetry_data
 
     # --- Time window and bucket size ---
     since = datetime.utcnow() - timedelta(hours=hours)
     interval = _bucket_interval(hours)
 
-    # --- Conditional aggregation query ---
-    # time_bucket() is a TimescaleDB function that rounds a timestamp down to
-    # the nearest bucket boundary (e.g. 10:03:47 → 10:03:00 for 1-minute buckets).
-    # CASE WHEN ... END inside AVG() selects only the relevant rows for each tag;
-    # rows for other tags contribute NULL which AVG() ignores automatically.
-    #
-    # The interval string is chosen from a fixed set (_bucket_interval) — it is
-    # not user-supplied so embedding it in the SQL text is safe.
+    # --- Long-form query: one row per (bucket, tag_key) ---
+    # JOIN to tag_definition gives the slug key so results are keyed by contract
+    # slug ("frequency", "power", …) rather than integer tag_definition_id.
+    # The interval string is chosen from a fixed lookup — not user-supplied —
+    # so embedding it directly in the SQL text is safe.
     sql = text("""
         SELECT
-            time_bucket('{interval}', timestamp) AS bucket,
-            AVG(CASE WHEN tag_definition_id = 6 THEN value_num END) AS frequency,
-            AVG(CASE WHEN tag_definition_id = 3 THEN value_num END) AS current,
-            AVG(CASE WHEN tag_definition_id = 7 THEN value_num END) AS power,
-            AVG(CASE WHEN tag_definition_id = 1 THEN value_num END) AS rpm,
-            AVG(CASE WHEN tag_definition_id = 2 THEN value_num END) AS torque,
-            AVG(CASE WHEN tag_definition_id = 5 THEN value_num END) AS output_voltage,
-            AVG(CASE WHEN tag_definition_id = 4 THEN value_num END) AS dc_voltage
-        FROM telemetry_data
-        WHERE component_instance_id = :cid
-          AND company_id             = :company_id
-          AND timestamp             >= :since
-        GROUP BY bucket
-        ORDER BY bucket ASC
+            time_bucket('{interval}', td.timestamp) AS bucket,
+            tdef.key                                AS tag_key,
+            AVG(td.value_num)                       AS avg_value
+        FROM telemetry_data td
+        JOIN tag_definition tdef
+          ON tdef.id = td.tag_definition_id
+        WHERE td.component_instance_id = :cid
+          AND td.company_id             = :company_id
+          AND td.timestamp             >= :since
+        GROUP BY bucket, tdef.key
+        ORDER BY bucket ASC, tdef.key
     """.format(interval=interval))
 
     rows = db.execute(sql, {
@@ -336,11 +337,26 @@ def get_history(
         "since":      since,
     }).mappings().all()
 
-    # Map each RowMapping to the bucket schema
-    buckets = [HistoryBucketResponse(**dict(row)) for row in rows]
+    # --- Python-side pivot: collect (bucket, tag_key, avg_value) into per-bucket dicts ---
+    # Each unique bucket gets one HistoryBucketResponse with all its tag values
+    # in a tags dict, symmetric with the live endpoint shape.
+    buckets_map: dict = {}
+    for r in rows:
+        b = r["bucket"]
+        if b not in buckets_map:
+            buckets_map[b] = {"bucket": b, "tags": {}}
+        if r["avg_value"] is not None:
+            buckets_map[b]["tags"][r["tag_key"]] = r["avg_value"]
+
+    # Sort by bucket ascending; buckets_map insertion order is not guaranteed
+    # across all Python versions when keys are datetime objects.
+    data = [
+        HistoryBucketResponse(**v)
+        for v in sorted(buckets_map.values(), key=lambda x: x["bucket"])
+    ]
 
     return MachineHistoryResponse(
         machine_id=machine_id,
         hours=hours,
-        data=buckets,
+        data=data,
     )

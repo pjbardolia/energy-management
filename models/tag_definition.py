@@ -37,8 +37,19 @@ class TagDefinition(Base):
         index=True
     )
 
-    # Human-readable measurement name, e.g. "Output Frequency", "DC Bus Voltage"
+    # Human-readable measurement name, e.g. "Output Frequency", "DC Bus Voltage".
+    # Operators may rename this label; the stable API contract is the 'key' column.
     name = Column(
+        String,
+        nullable=False
+    )
+
+    # Machine-readable slug — the stable contract with gateways and frontends.
+    # Examples: "frequency", "dc_voltage", "output_voltage"
+    # Unique per company via migration 004 index (uq_tag_definition_company_key).
+    # Written once on creation; treat as immutable after the first telemetry row
+    # references this tag.
+    key = Column(
         String,
         nullable=False
     )

@@ -1,19 +1,22 @@
 """
-Phase 5a — Production Gateway Service
-=======================================
-Reads Modbus registers from the INVT CHF100A VFD, buffers readings to a local
-SQLite outbox, and forwards them to the cloud API via HTTPS POST.
+Phase 5a — Production Gateway Service (multi-device)
+======================================================
+Polls 14 VFDs across three models on a single RS485 bus, buffers every reading
+to a local SQLite outbox, and forwards them to the cloud API via HTTPS POST.
 
 Architecture (ADR-006):
     Modbus Poller → SQLite outbox buffer → HTTPS Forwarder → POST /data
 
-This file extends the working Modbus reader in logger.py into a full
-store-and-forward pipeline with:
-  - Config-driven operation (no hardcoded values — everything in config.json)
-  - SQLite outbox for resilience during network outages
-  - JWT token management with auto-renewal before expiry
-  - Structured logging to console (INFO) and rotating log file (DEBUG)
-  - Crash-resilient main loop — recovers from all expected error conditions
+Supported VFD models (register maps are defined in VFD_REGISTER_MAPS below —
+they are hardware specs, not deployment config, so they live in code):
+  - INVT_CHF100A  : 8 registers at 0x3000
+  - YASKAWA_A1000 : 6 registers at 0x0023
+  - YASKAWA_V1000 : 6 registers at 0x0023  (identical layout to A1000)
+  - YASKAWA_F7    : 5 registers at 0x0023
+
+Device roster (which slave ID maps to which model and component_instance_id)
+and all RS485/API parameters live in config.json — no code changes are needed
+to add, remove, or reconfigure a device.
 
 Run manually on Pi to verify:
     python3 gateway_service.py
@@ -74,32 +77,114 @@ log.addHandler(_file_handler)
 
 
 # ---------------------------------------------------------------------------
+# VFD register maps — hardware specs, defined once here in code.
+#
+# Each entry in "registers" is a tuple:
+#   (tag_name, register_index, divisor)
+#
+#   tag_name      : str  — key to look up in config["tag_definition_ids"] to
+#                          get the backend tag_definition_id for this reading.
+#                   None — the register is read from the device (as part of a
+#                          single block read) but is never stored in the DB.
+#                          Using None avoids two block reads where one suffices.
+#
+#   register_index: int  — 0-based position in the response register array.
+#
+#   divisor       : int  — raw value is divided by this to get the engineering
+#                          value (e.g. raw 5000 / 100 = 50.00 Hz).
+#                          Divisor of 1 means the raw value is used unchanged.
+# ---------------------------------------------------------------------------
+
+# INVT CHF100A — 8 consecutive registers starting at 0x3000.
+# Source: INVT CHF100A communications manual, parameter group F7.
+_INVT_CHF100A_SPEC = {
+    "address": 0x3000,
+    "count": 8,
+    "registers": [
+        ("frequency",      0, 100),  # Output frequency  / 100 → Hz
+        (None,             1, 100),  # Reference frequency — read but not stored
+        ("dc_voltage",     2, 10),   # DC bus voltage    / 10  → V
+        ("output_voltage", 3, 1),    # Output voltage    raw   → V
+        ("current",        4, 10),   # Output current    / 10  → A
+        ("rpm",            5, 1),    # Motor speed       raw   → RPM
+        ("power",          6, 10),   # Output power      / 10  → kW
+        ("torque",         7, 10),   # Output torque     / 10  → %
+    ],
+}
+
+# Yaskawa A1000 / V1000 — 6 consecutive registers starting at 0x0023.
+# Both models use the same register layout so they share this spec.
+# Source: Yaskawa A1000 technical manual, U1-xx monitor parameters.
+# Note: register [5] holds a speed/rpm value but it is not reliable on this
+# installation — tag_name is None so it is read as part of the block but
+# never stored in the database.
+_YASKAWA_A1000_V1000_SPEC = {
+    "address": 0x0023,
+    "count": 6,
+    "registers": [
+        ("frequency",      0, 100),  # Output frequency  / 100 → Hz
+        ("output_voltage", 1, 10),   # Output voltage    / 10  → V
+        ("current",        2, 100),  # Output current    / 100 → A  (0.01 A resolution)
+        ("power",          3, 10),   # Output power      / 10  → kW
+        ("dc_voltage",     4, 1),    # DC bus voltage    raw   → V
+        (None,             5, 1),    # Speed/RPM — not available on this installation
+    ],
+}
+
+# Yaskawa F7 — 5 consecutive registers starting at 0x0023.
+# Source: Yaskawa F7 technical manual, U1-xx monitor parameters.
+_YASKAWA_F7_SPEC = {
+    "address": 0x0023,
+    "count": 5,
+    "registers": [
+        ("frequency",      0, 100),  # Output frequency  / 100 → Hz
+        ("output_voltage", 1, 10),   # Output voltage    / 10  → V
+        ("current",        2, 100),  # Output current    / 100 → A  (0.01 A resolution)
+        ("power",          3, 10),   # Output power      / 10  → kW
+        ("dc_voltage",     4, 1),    # DC bus voltage    raw   → V
+    ],
+}
+
+# Master lookup: vfd_model string (as used in config.json) → register spec.
+# YASKAWA_A1000 and YASKAWA_V1000 point to the same spec object — they are
+# kept as separate model names so the device list is self-documenting.
+VFD_REGISTER_MAPS = {
+    "INVT_CHF100A":   _INVT_CHF100A_SPEC,
+    "YASKAWA_A1000":  _YASKAWA_A1000_V1000_SPEC,
+    "YASKAWA_V1000":  _YASKAWA_A1000_V1000_SPEC,   # same layout as A1000
+    "YASKAWA_F7":     _YASKAWA_F7_SPEC,
+}
+
+
+# ---------------------------------------------------------------------------
 # COMPONENT 1 — Config loader
 # ---------------------------------------------------------------------------
 
 _CONFIG_PATH = os.path.join(_SCRIPT_DIR, "config.json")
 
-# Required keys — startup fails with a clear error if any are missing.
-_REQUIRED_CONFIG_KEYS = [
+# Top-level keys the service cannot start without.
+_REQUIRED_TOP_KEYS = [
     "api_base_url",
     "api_username",
     "api_password",
     "modbus_port",
     "modbus_baudrate",
-    "modbus_slave_id",
     "polling_interval_seconds",
-    "component_instance_id",
     "company_id",
-    "tag_map",
+    "tag_definition_ids",   # {tag_name: tag_definition_id} — same across all devices
+    "devices",              # list of device dicts
 ]
+
+# Keys required inside each device entry in the "devices" list.
+_REQUIRED_DEVICE_KEYS = ["name", "slave_id", "vfd_model", "component_instance_id"]
 
 
 def load_config() -> dict:
     """Load and validate config.json.
 
-    Raises FileNotFoundError if config.json is absent (tell the user to
-    copy config.json.example and fill in real values).
-    Raises ValueError if any required key is missing.
+    Raises FileNotFoundError if config.json is absent.
+    Raises ValueError if required keys are missing or any device entry is
+    malformed or references an unknown vfd_model.
     Never logs credentials.
     """
     if not os.path.exists(_CONFIG_PATH):
@@ -112,24 +197,59 @@ def load_config() -> dict:
     with open(_CONFIG_PATH) as f:
         config = json.load(f)
 
-    missing = [k for k in _REQUIRED_CONFIG_KEYS if k not in config]
+    # Check top-level required keys.
+    missing = [k for k in _REQUIRED_TOP_KEYS if k not in config]
     if missing:
-        raise ValueError(
-            "config.json is missing required keys: {}".format(missing)
-        )
+        raise ValueError("config.json is missing required keys: {}".format(missing))
+
+    # Validate tag_definition_ids is a non-empty dict.
+    if not isinstance(config["tag_definition_ids"], dict) or not config["tag_definition_ids"]:
+        raise ValueError("config.json: 'tag_definition_ids' must be a non-empty dict.")
+
+    # Validate devices list.
+    devices = config["devices"]
+    if not isinstance(devices, list) or len(devices) == 0:
+        raise ValueError("config.json: 'devices' must be a non-empty list.")
+
+    for i, device in enumerate(devices):
+        # Check each device has all required keys.
+        missing_dev = [k for k in _REQUIRED_DEVICE_KEYS if k not in device]
+        if missing_dev:
+            raise ValueError(
+                "config.json: device[{}] ({}) is missing keys: {}".format(
+                    i, device.get("name", "?"), missing_dev
+                )
+            )
+        # Check the vfd_model is one we know how to talk to.
+        if device["vfd_model"] not in VFD_REGISTER_MAPS:
+            raise ValueError(
+                "config.json: device '{}' has unknown vfd_model '{}'. "
+                "Known models: {}".format(
+                    device["name"],
+                    device["vfd_model"],
+                    list(VFD_REGISTER_MAPS.keys()),
+                )
+            )
 
     # Log non-sensitive config values so startup is auditable.
     log.info(
-        "Config loaded — api_base_url=%s  port=%s  baud=%d  slave=%d  "
-        "poll=%ds  component_instance_id=%d  company_id=%d",
+        "Config loaded — api_base_url=%s  port=%s  baud=%d  poll=%ds  "
+        "%d device(s) configured",
         config["api_base_url"],
         config["modbus_port"],
         config["modbus_baudrate"],
-        config["modbus_slave_id"],
         config["polling_interval_seconds"],
-        config["component_instance_id"],
-        config["company_id"],
+        len(devices),
     )
+    for device in devices:
+        log.info(
+            "  Device: %-8s  slave=%2d  model=%-16s  component_instance_id=%d",
+            device["name"],
+            device["slave_id"],
+            device["vfd_model"],
+            device["component_instance_id"],
+        )
+
     return config
 
 
@@ -182,7 +302,8 @@ def write_to_outbox(payload_dict: dict):
     conn.close()
 
     log.debug(
-        "Outbox write: tag_definition_id=%s  value_num=%s",
+        "Outbox write: component_instance_id=%s  tag_definition_id=%s  value_num=%s",
+        payload_dict.get("component_instance_id"),
         payload_dict.get("tag_definition_id"),
         payload_dict.get("value_num"),
     )
@@ -327,12 +448,12 @@ def forward_outbox(token_manager: TokenManager, api_base_url: str):
     chronological order even after a backlog accumulates during an outage.
 
     Behaviour on each response code:
-    - 201 Created    → mark_sent(), continue to next row
-    - 401 Unauthorized → on_401() + one retry; if retry also fails, increment
-                         retry_count and continue to the next row
+    - 201 Created       → mark_sent(), continue to next row
+    - 401 Unauthorized  → on_401() + one retry; if retry also fails, increment
+                          retry_count and continue to the next row
     - Any other 4xx/5xx → increment retry_count, log warning, continue
-    - ConnectionError/Timeout → log warning, STOP this cycle (network is down;
-                                no point trying more rows until next poll)
+    - ConnectionError / Timeout → log warning, STOP this cycle (network is
+                          down; no point trying more rows until next poll)
     """
     url = api_base_url.rstrip("/") + "/data"
     rows = fetch_unsent()
@@ -372,8 +493,9 @@ def forward_outbox(token_manager: TokenManager, api_base_url: str):
         if resp.status_code == 201:
             mark_sent(row_id)
             log.info(
-                "Sent outbox row %d — tag_definition_id=%s  value_num=%s",
+                "Sent outbox row %d — component=%s  tag=%s  value_num=%s",
                 row_id,
+                payload.get("component_instance_id"),
                 payload.get("tag_definition_id"),
                 payload.get("value_num"),
             )
@@ -422,99 +544,117 @@ def forward_outbox(token_manager: TokenManager, api_base_url: str):
 
 
 # ---------------------------------------------------------------------------
-# COMPONENT 5 — Modbus reader
+# COMPONENT 5a — Modbus reader (single device)
 # ---------------------------------------------------------------------------
 
-# Register layout at address 0x3000 — identical to logger.py.
-# Each entry is (register_name, scale_divisor).
-# Dividing by 1 means the raw value is used unchanged.
-REGISTER_MAP = [
-    ("frequency",      100),   # registers[0] / 100 → Hz
-    ("ref_frequency",  100),   # registers[1] / 100 → Hz  (often null in tag_map)
-    ("dc_voltage",     10),    # registers[2] / 10  → V
-    ("output_voltage", 1),     # registers[3] raw   → V
-    ("current",        10),    # registers[4] / 10  → A
-    ("rpm",            1),     # registers[5] raw   → RPM
-    ("power",          10),    # registers[6] / 10  → kW
-    ("torque",         10),    # registers[7] / 10  → %
-]
+def read_modbus(
+    client: ModbusSerialClient,
+    slave_id: int,
+    vfd_model: str,
+) -> dict | None:
+    """Read registers from one VFD and return decoded tag values.
 
+    Looks up the register spec for vfd_model from VFD_REGISTER_MAPS, reads
+    the appropriate address and count, then applies each register's divisor
+    to produce engineering-unit values.
 
-def read_modbus(client: ModbusSerialClient, slave_id: int) -> dict | None:
-    """Read 8 registers from the VFD and return decoded values.
-
-    Uses the same address (0x3000), count (8), and scaling as logger.py so
-    the two scripts produce identical numeric values.
+    Args:
+        client:    Open ModbusSerialClient (one shared connection for all devices
+                   on the same RS485 bus).
+        slave_id:  Modbus slave address of this specific device.
+        vfd_model: Key into VFD_REGISTER_MAPS (e.g. "INVT_CHF100A").
 
     Returns:
-        dict mapping register_name → float value, or None on any Modbus error.
-        None signals the caller to skip this poll cycle without writing to outbox.
+        dict mapping tag_name → float value for all non-None named registers.
+        Returns None on any Modbus error — caller should skip this device's
+        readings for this cycle without writing to outbox.
 
     Error handling:
         ModbusIOException is caught here and logged as WARNING — it is a normal
         transient condition (CRC error, timeout, VFD powered off) that does not
-        warrant a full traceback.  The generic isError() check below catches any
-        other Modbus error type that pymodbus returns as an error response object
-        rather than raising an exception.
+        warrant a full traceback.  The isError() check below catches error
+        response objects that pymodbus returns instead of raising.
     """
+    spec = VFD_REGISTER_MAPS[vfd_model]
+    address = spec["address"]
+    count = spec["count"]
+
     try:
         rr = client.read_holding_registers(
-            address=0x3000,
-            count=8,
+            address=address,
+            count=count,
             device_id=slave_id,
         )
     except ModbusIOException as exc:
-        # ModbusIOException covers serial-level failures: CRC mismatch, no
-        # response within timeout, framing errors.  Log as WARNING (not ERROR)
-        # because one bad read is expected occasionally and not actionable.
-        log.warning("Modbus read failed: %s", exc)
+        # Transient serial-level failure (CRC mismatch, no response, framing
+        # error).  Log as WARNING — one bad read is expected occasionally.
+        log.warning("Slave %d [%s]: Modbus read failed: %s", slave_id, vfd_model, exc)
         return None
 
     if rr.isError():
-        # pymodbus can also signal errors by returning an error response object
-        # instead of raising — this guard catches those cases.
-        log.warning("Modbus error response from slave %d: %s", slave_id, rr)
+        # pymodbus can also signal errors as a response object rather than
+        # raising an exception — this guard catches those cases.
+        log.warning("Slave %d [%s]: Modbus error response: %s", slave_id, vfd_model, rr)
         return None
 
+    # Decode registers using this model's spec.
+    # Skip entries where tag_name is None — those registers are read as part
+    # of the block but carry no value we store in the database.
     values = {}
-    for i, (name, divisor) in enumerate(REGISTER_MAP):
-        values[name] = rr.registers[i] / divisor
+    for tag_name, reg_index, divisor in spec["registers"]:
+        if tag_name is None:
+            continue
+        values[tag_name] = rr.registers[reg_index] / divisor
 
     log.debug(
-        "Modbus OK — freq=%.2f Hz  current=%.1f A  rpm=%d RPM  power=%.1f kW",
-        values["frequency"],
-        values["current"],
-        int(values["rpm"]),
-        values["power"],
+        "Slave %d [%s]: OK — freq=%.2f Hz  current=%.3f A  "
+        "%d tag(s) decoded",
+        slave_id, vfd_model,
+        values.get("frequency", 0.0),
+        values.get("current", 0.0),
+        len(values),
     )
     return values
 
 
 # ---------------------------------------------------------------------------
-# COMPONENT 5 — Main polling loop
+# COMPONENT 5b — Main polling loop
 # ---------------------------------------------------------------------------
 
 def run(config: dict):
-    """Start the poll → buffer → forward loop.  Runs indefinitely.
+    """Poll all devices, buffer readings, and forward to the cloud.  Runs indefinitely.
 
-    Every error inside the loop is caught and logged; the loop always
-    continues so the systemd service never needs to restart due to a
-    Python exception (restart is still available for hard crashes like OOM).
+    Each poll cycle:
+      1. Iterate over every device in config["devices"] in order.
+      2. Read Modbus registers for that device.
+      3. For each decoded register value, look up the tag_definition_id in
+         config["tag_definition_ids"].  If found, write one outbox row.
+      4. After all devices are polled, forward the outbox to the cloud API.
+      5. Sleep for polling_interval_seconds.
+
+    Error handling:
+      - ModbusIOException per device → skip that device, continue to next.
+      - OSError errno 5 (USB device lost) → log CRITICAL, exit for systemd restart.
+      - 5 consecutive unhandled exceptions → log CRITICAL, exit for systemd restart.
+      - Any other exception → log ERROR with traceback, sleep 30 s, resume loop.
 
     Args:
         config: Validated dict from load_config().
     """
-    poll_interval    = config["polling_interval_seconds"]
-    modbus_port      = config["modbus_port"]
-    modbus_baud      = config["modbus_baudrate"]
-    slave_id         = config["modbus_slave_id"]
-    component_id     = config["component_instance_id"]
-    company_id       = config["company_id"]
-    tag_map          = config["tag_map"]      # {register_name: tag_definition_id | null}
-    api_base_url     = config["api_base_url"]
+    poll_interval       = config["polling_interval_seconds"]
+    modbus_port         = config["modbus_port"]
+    modbus_baud         = config["modbus_baudrate"]
+    company_id          = config["company_id"]
+    api_base_url        = config["api_base_url"]
+    devices             = config["devices"]
+    tag_definition_ids  = config["tag_definition_ids"]
+    # tag_definition_ids maps tag_name → tag_definition_id (int).
+    # Tags not present in this dict are not stored (e.g. "ref_frequency").
 
-    # ModbusSerialClient parameters match logger.py exactly:
-    # parity='N', stopbits=1, bytesize=8 are the VFD's factory RS485 settings.
+    # One ModbusSerialClient for the entire RS485 bus.
+    # All devices share the same port — they are distinguished by slave_id.
+    # parity='N', stopbits=1, bytesize=8 are the standard RS485 settings used
+    # by all three VFD models on this installation.
     client = ModbusSerialClient(
         port=modbus_port,
         baudrate=modbus_baud,
@@ -531,8 +671,8 @@ def run(config: dict):
     )
 
     log.info(
-        "Gateway starting up — port=%s  baud=%d  slave=%d  poll=%ds",
-        modbus_port, modbus_baud, slave_id, poll_interval,
+        "Gateway starting up — port=%s  baud=%d  poll=%ds  %d device(s)",
+        modbus_port, modbus_baud, poll_interval, len(devices),
     )
 
     if not client.connect():
@@ -547,79 +687,91 @@ def run(config: dict):
 
     log.info("Modbus connected on %s", modbus_port)
 
-    # Consecutive-failure counter — reset to 0 after every successful Modbus read.
-    # If 5 failures occur back-to-back without a single success in between, the
-    # process exits so systemd can restart it with a clean state.
-    # This catches permanent failure modes (e.g. pymodbus internal state corruption)
-    # that the OSError/errno-5 guard below doesn't cover.
+    # Consecutive-failure counter for the top-level exception handler.
+    # Counts unhandled exceptions in a row; reset after any successful cycle.
+    # At 5, we exit so systemd restarts the process in a clean state.
     _MAX_CONSECUTIVE_FAILURES = 5
     _consecutive_failures = 0
 
     while True:
         try:
-            # ── Step 1: Read Modbus registers ───────────────────────────
-            values = read_modbus(client, slave_id)
-
-            if values is None:
-                # Modbus read failed — skip this cycle.
-                # Do NOT write to outbox: we have no valid data.
-                # A failed read does not count as a consecutive failure because
-                # read_modbus() already handles ModbusIOException gracefully.
-                log.warning("Modbus read returned None — skipping poll cycle")
-                time.sleep(poll_interval)
-                continue
-
-            # Successful read — reset the consecutive-failure counter.
-            _consecutive_failures = 0
-
-            # Timestamp in the format the /data endpoint expects.
             timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+            total_written = 0   # outbox writes this cycle across all devices
 
-            # ── Step 2: Write readings to outbox ────────────────────────
-            # One row per tag.  Null tag_definition_id means the register
-            # is read but not stored in the backend (e.g. ref_frequency).
-            written = 0
-            for register_name, tag_definition_id in tag_map.items():
-                if tag_definition_id is None:
-                    log.debug("Skipping %s — no tag_definition_id configured",
-                              register_name)
+            # ── Step 1: Poll each device ─────────────────────────────────
+            for device in devices:
+                dev_name    = device["name"]
+                slave_id    = device["slave_id"]
+                vfd_model   = device["vfd_model"]
+                component_id = device["component_instance_id"]
+
+                # Short label used in log messages: "Jet 33 / slave=1"
+                dev_label = "{} / slave={}".format(dev_name, slave_id)
+
+                # Read registers from this device.
+                # Returns None on any Modbus error — skip this device for this cycle.
+                values = read_modbus(client, slave_id, vfd_model)
+
+                if values is None:
+                    # Modbus failure is already logged inside read_modbus().
+                    # We do NOT count this as a consecutive failure — it is a
+                    # handled condition, not an unhandled exception.
+                    log.warning("[%s] Skipping — no data this cycle", dev_label)
                     continue
 
-                if register_name not in values:
-                    log.warning(
-                        "tag_map key '%s' has no entry in REGISTER_MAP — skipping",
-                        register_name,
-                    )
-                    continue
+                # ── Step 2: Write each tag value to the outbox ───────────
+                # For each decoded register, look up its tag_definition_id.
+                # Tags absent from tag_definition_ids are silently skipped
+                # (e.g. "ref_frequency" on INVT, "torque" on Yaskawa).
+                written = 0
+                for tag_name, value in values.items():
+                    tag_def_id = tag_definition_ids.get(tag_name)
+                    if tag_def_id is None:
+                        # This tag exists in the register map but has no
+                        # corresponding DB entry — skip silently.
+                        log.debug(
+                            "[%s] No tag_definition_id for '%s' — skipping",
+                            dev_label, tag_name,
+                        )
+                        continue
 
-                # Note: the API uses value_num for numeric readings, not "value".
-                # The DataCreate schema (schemas/telemetry.py) has value_num
-                # (float) and value_text (str) — VFD readings are always numeric.
-                payload = {
-                    "timestamp":             timestamp,
-                    "component_instance_id": component_id,
-                    "tag_definition_id":     tag_definition_id,
-                    "value_num":             values[register_name],
-                    "company_id":            company_id,
-                }
-                write_to_outbox(payload)
-                written += 1
+                    # Note: the API uses value_num for numeric readings.
+                    # The DataCreate schema has value_num (float) and
+                    # value_text (str) — all VFD readings are numeric.
+                    payload = {
+                        "timestamp":             timestamp,
+                        "component_instance_id": component_id,
+                        "tag_definition_id":     tag_def_id,
+                        "value_num":             value,
+                        "company_id":            company_id,
+                    }
+                    write_to_outbox(payload)
+                    written += 1
 
-            log.info("Poll complete — %d reading(s) written to outbox", written)
+                total_written += written
+                log.info(
+                    "[%s] %d reading(s) written to outbox",
+                    dev_label, written,
+                )
 
-            # ── Step 3: Forward outbox to cloud ─────────────────────────
+            # ── Step 3: Forward outbox to cloud API ──────────────────────
+            log.info(
+                "Poll cycle complete — %d total reading(s) from %d device(s)",
+                total_written, len(devices),
+            )
             forward_outbox(token_manager, api_base_url)
+
+            # Reaching here means no unhandled exception occurred this cycle.
+            _consecutive_failures = 0
 
         except Exception as exc:
             _consecutive_failures += 1
 
-            # ── Check for USB serial device loss (errno 5: Input/output error) ──
-            # OSError with errno 5 means the USB device was physically unplugged
-            # or the kernel dropped the serial device node.  The ModbusSerialClient
-            # file handle is now dead — sleeping and retrying in this process would
-            # loop forever on the same dead handle.  Exit immediately so systemd
-            # restarts the process (Restart=always, RestartSec=10) with a fresh
-            # handle after the adapter is re-plugged.
+            # ── USB serial device lost (errno 5: Input/output error) ─────
+            # The device node (/dev/ttyUSBx) was dropped by the kernel —
+            # the file handle is dead.  Looping would spin forever on the
+            # same broken handle.  Exit immediately so systemd restarts the
+            # process (Restart=always, RestartSec=10) with a fresh handle.
             if isinstance(exc, OSError) and exc.errno == 5:
                 log.critical(
                     "Serial device lost (errno 5: I/O error) — "
@@ -627,10 +779,9 @@ def run(config: dict):
                 )
                 raise SystemExit(1)
 
-            # ── Check consecutive-failure threshold ──────────────────────────────
-            # Any other unhandled exception (bug, pymodbus state corruption, etc.)
-            # increments the counter.  Five in a row without a successful poll
-            # means we are stuck — exit so systemd can restart cleanly.
+            # ── Consecutive-failure threshold ─────────────────────────────
+            # Five unhandled exceptions in a row without any successful cycle
+            # means the process is stuck.  Exit so systemd can restart cleanly.
             if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
                 log.critical(
                     "%d consecutive unhandled exceptions — "
@@ -640,7 +791,7 @@ def run(config: dict):
                 )
                 raise SystemExit(1)
 
-            # ── Recoverable unexpected error ─────────────────────────────────────
+            # ── Recoverable unexpected error ──────────────────────────────
             # Log the full traceback for diagnosis, sleep 30 s, then resume.
             log.error(
                 "Unexpected error in poll loop "

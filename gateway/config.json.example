@@ -1,21 +1,37 @@
 {
+  "_comment": "Copy this file to config.json and fill in real values. config.json is gitignored — never commit it.",
+
   "api_base_url": "http://YOUR_SERVER_IP:8001",
-  "api_username": "your_username@example.com",
+  "api_username": "your_gateway_account@example.com",
   "api_password": "your_password_here",
-  "modbus_port": "/dev/ttyUSB0",
+  "modbus_port": "/dev/ttyUSB3",
   "modbus_baudrate": 9600,
-  "modbus_slave_id": 1,
   "polling_interval_seconds": 10,
-  "component_instance_id": 1,
   "company_id": 1,
-  "tag_map": {
-    "frequency":      6,
-    "ref_frequency":  null,
+
+  "tag_definition_ids": {
+    "rpm":            1,
+    "torque":         2,
+    "current":        3,
     "dc_voltage":     4,
     "output_voltage": 5,
-    "current":        3,
-    "rpm":            1,
-    "power":          7,
-    "torque":         2
-  }
+    "frequency":      6,
+    "power":          7
+  },
+
+  "devices": [
+    {
+      "_comment":              "One entry per VFD. Supported vfd_model values: INVT_CHF100A, YASKAWA_A1000, YASKAWA_V1000, YASKAWA_F7",
+      "name":                  "Jet 01",
+      "slave_id":              1,
+      "vfd_model":             "INVT_CHF100A",
+      "component_instance_id": 7
+    },
+    {
+      "name":                  "Jet 02",
+      "slave_id":              2,
+      "vfd_model":             "INVT_CHF100A",
+      "component_instance_id": 8
+    }
+  ]
 }

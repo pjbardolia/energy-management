@@ -28,6 +28,7 @@ def create_tag_definition(
 ):
     db_tag = TagDefinition(
         name=tag.name,
+        key=tag.key,        # stable slug — unique per (company_id, key)
         unit=tag.unit,
         description=tag.description,
         data_type=tag.data_type,
@@ -44,7 +45,10 @@ def create_tag_definition(
         db.rollback()
         raise HTTPException(
             status_code=400,
-            detail="Could not create tag definition — check that company_id exists.",
+            detail=(
+                "Could not create tag definition — check that company_id exists "
+                "and that the key is unique for this company."
+            ),
         )
 
     db.refresh(db_tag)

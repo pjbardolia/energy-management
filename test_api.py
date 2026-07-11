@@ -19,13 +19,37 @@ HOW TO RUN (from a second terminal tab, in the project folder):
 
 import base64
 import json
+import os
+import sys
 import time
 import urllib.request
 import urllib.error
 
-# Inside the api container, uvicorn is listening on port 8000.
-# (From your Mac's browser it's 8001, but this script runs *inside* the container.)
-BASE_URL = "http://localhost:8000"
+# ---------------------------------------------------------------------------
+# Guard A — must be set or the script exits immediately, before any network call.
+# This script creates and modifies database rows.  Never run it against a
+# database that contains real production data.
+# ---------------------------------------------------------------------------
+if not os.getenv("ALLOW_DESTRUCTIVE_TESTS"):
+    print("ABORT: set ALLOW_DESTRUCTIVE_TESTS=1 to run this script.")
+    print("This script creates and modifies database rows.")
+    sys.exit(1)
+
+# Guard C — configurable target URL.
+# Inside the api container, uvicorn is at port 8000.
+# From a Mac terminal against the live server:
+#   TEST_API_URL=http://165.22.247.235:8001
+BASE_URL = os.getenv("TEST_API_URL", "http://localhost:8000")
+
+# Guard B credentials — both must be set or the script exits here, before any
+# write.  Used in the pre-flight company check (runs after step 1, before step 2)
+# to verify the target DB contains only test companies.
+_preflight_user = os.getenv("TEST_PREFLIGHT_USER")
+_preflight_pass = os.getenv("TEST_PREFLIGHT_PASSWORD")
+if not _preflight_user or not _preflight_pass:
+    print("ABORT: TEST_PREFLIGHT_USER and TEST_PREFLIGHT_PASSWORD must both be set.")
+    print("Preflight verifies the target DB contains only test companies before any writes.")
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +147,40 @@ suffix = str(int(time.time()))
 # 1) Health -----------------------------------------------------------------
 status, raw, parsed = request("GET", "/health")
 record("GET /health", status, status == 200, raw[:60])
+
+# Guard B — pre-flight company check ----------------------------------------
+# Log in with the pre-flight credentials and call GET /companies BEFORE any
+# write.  Abort if the target DB contains any company whose name does not
+# include "test" (case-insensitive).  An empty company list is allowed (fresh DB).
+print()
+print("-- Pre-flight company check --")
+_pf_login_status, _, _pf_parsed = request(
+    "POST", "/login",
+    {"username": _preflight_user, "password": _preflight_pass},
+)
+if (_pf_login_status != 200
+        or not isinstance(_pf_parsed, dict)
+        or not _pf_parsed.get("access_token")):
+    print("ABORT: Pre-flight login failed (HTTP {}).".format(_pf_login_status))
+    print("Check TEST_PREFLIGHT_USER / TEST_PREFLIGHT_PASSWORD credentials.")
+    sys.exit(1)
+
+_pf_token = _pf_parsed["access_token"]
+_, _, _pf_companies = request("GET", "/companies", token=_pf_token)
+if not isinstance(_pf_companies, list):
+    print("ABORT: Pre-flight GET /companies failed — cannot verify target database.")
+    sys.exit(1)
+
+for _c in _pf_companies:
+    if "test" not in (_c.get("company_name") or "").lower():
+        print('ABORT: Found non-test company "{}" (id={}).'.format(
+            _c.get("company_name"), _c.get("id")))
+        print("Refusing to run destructive tests against this database.")
+        sys.exit(1)
+
+print("Pre-flight passed: {} existing company/companies are all test fixtures.".format(
+    len(_pf_companies)))
+print()
 
 # 2) Create company ---------------------------------------------------------
 # POST /companies is public — company must exist before we can create a user.
@@ -265,24 +323,28 @@ else:
 tag_ids = {}  # maps short name -> tag_definition id
 
 TAG_SPECS = [
-    # (short_name,     display_name,       unit,  data_type)
-    ("rpm",            "Rotation Speed",   "rpm", "float"),
-    ("torque",         "Output Torque",    "Nm",  "float"),
-    ("current",        "Output Current",   "A",   "float"),
-    ("bus_voltage",    "DC Bus Voltage",   "V",   "float"),
-    ("output_voltage", "Output Voltage",   "V",   "float"),
-    ("frequency",      "Output Frequency", "Hz",  "float"),
-    ("power",          "Output Power",     "kW",  "float"),
-    ("temperature",    "Temperature",      "°C",  "float"),
-    ("pressure",       "Pressure",         "bar", "float"),
-    ("fault_code",     "Fault Code",       "",    "text"),
+    # (short_name,     key,              display_name,       unit,  data_type)
+    # 'key' is the stable slug posted to the API (gateway/frontend contract).
+    # 'short_name' is the local tag_ids dict key used by LINK_SPECS below.
+    # They differ for DC Bus Voltage: the legacy short_name "bus_voltage" keeps
+    # LINK_SPECS working; the API key is the gateway contract slug "dc_voltage".
+    ("rpm",            "rpm",            "Rotation Speed",   "rpm", "float"),
+    ("torque",         "torque",         "Output Torque",    "Nm",  "float"),
+    ("current",        "current",        "Output Current",   "A",   "float"),
+    ("bus_voltage",    "dc_voltage",     "DC Bus Voltage",   "V",   "float"),
+    ("output_voltage", "output_voltage", "Output Voltage",   "V",   "float"),
+    ("frequency",      "frequency",      "Output Frequency", "Hz",  "float"),
+    ("power",          "power",          "Output Power",     "kW",  "float"),
+    ("temperature",    "temperature",    "Temperature",      "°C",  "float"),
+    ("pressure",       "pressure",       "Pressure",         "bar", "float"),
+    ("fault_code",     "fault_code",     "Fault Code",       "",    "text"),
 ]
 
 if effective_company_id and token:
-    for short, display, unit, dtype in TAG_SPECS:
+    for short, key, display, unit, dtype in TAG_SPECS:
         status, raw, parsed = request(
             "POST", "/tag-definitions",
-            {"name": display, "unit": unit, "data_type": dtype,
+            {"name": display, "key": key, "unit": unit, "data_type": dtype,
              "company_id": effective_company_id},
             token=token,
         )
@@ -477,7 +539,9 @@ if machine_id:
         "GET", "/machines/{}/history?hours=1".format(machine_id), token=token)
     hist_ok = status in (200, 404) and (
         status == 404 or (
-            "data" in (parsed or {}) and "machine_id" in (parsed or {})))
+            "data" in (parsed or {}) and "machine_id" in (parsed or {}) and
+            (not parsed["data"] or "tags" in parsed["data"][0])
+        ))
     record("GET /machines/{}/history".format(machine_id), status, hist_ok, raw[:90])
 else:
     record("GET /machines/{id}/history", None, False, "skipped: no machine_id")
