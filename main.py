@@ -30,6 +30,7 @@ from routers.component_type_router import router as component_type_router
 from routers.machine_component_router import router as machine_component_router
 from routers.tag_definition_router import router as tag_definition_router
 from routers.data_router import router as data_router
+from routers.telemetry_read import router as telemetry_read_router
 
 from passlib.context import CryptContext
 
@@ -65,6 +66,7 @@ app.include_router(component_type_router)      # POST/GET /component-types
 app.include_router(machine_component_router)   # POST/GET /machine-components
 app.include_router(tag_definition_router)      # POST/GET /tag-definitions
 app.include_router(data_router)                # POST/GET /data
+app.include_router(telemetry_read_router)      # GET /machines/live, /fleet/summary
 
 # Password hashing context — bcrypt==4.0.1 is pinned in requirements.txt
 # because newer bcrypt versions break passlib's internal API.
