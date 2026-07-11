@@ -15,3 +15,5 @@ gateway/config.json
 
 # Frontend — build output and installed packages
 frontend/node_modules/
+# Seed scripts are source code, not data dumps — must be versioned
+!scripts/*.sql
