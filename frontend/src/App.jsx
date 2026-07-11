@@ -155,15 +155,6 @@ const Dot = ({on}) => (
   </span>
 );
 
-/* ═══════════════════════════════════════════════════════════════
-   MEVION LOGO MARK  (geometric M)
-═══════════════════════════════════════════════════════════════ */
-const MevionMark = ({size=40}) => (
-  <svg width={size} height={Math.round(size*0.82)} viewBox="0 0 44 36" fill="none">
-    <path d="M1 35 L13 1 L22 17 L17 25 L7 35Z"  fill={C.red}/>
-    <path d="M43 35 L31 1 L22 17 L27 25 L37 35Z" fill={C.red}/>
-  </svg>
-);
 
 /* ═══════════════════════════════════════════════════════════════
    LOGIN PAGE
@@ -215,10 +206,7 @@ const LoginPage = ({onLogin}) => {
       {/* Brand mark */}
       <div style={{textAlign:"center",marginBottom:44}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:10,marginBottom:6}}>
-          <MevionMark size={44}/>
-          <span style={{fontSize:38,fontWeight:900,color:C.red,letterSpacing:-1.5,lineHeight:1}}>
-            mevion
-          </span>
+          <img src="/mevion-logo.png" style={{height:120, width:"auto"}} alt="mevion"/>
         </div>
         <div style={{fontSize:11,color:C.muted,letterSpacing:4,textTransform:"uppercase"}}>
           Data to Decisions
@@ -412,8 +400,7 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
       }}>
         <div style={{display:"flex",alignItems:"center",gap:14}}>
           <div style={{display:"flex",alignItems:"center",gap:8}}>
-            <MevionMark size={28}/>
-            <span style={{fontSize:20,fontWeight:900,color:C.red,letterSpacing:-1}}>mevion</span>
+            <img src="/mevion-logo.png" style={{height:48, width:"auto"}} alt="mevion"/>
           </div>
           <span style={{width:1,height:18,background:C.border}}/>
           <span style={{fontSize:13,color:C.muted,fontWeight:500}}>Factory Monitor</span>
@@ -556,8 +543,7 @@ const JetDetail = ({machine, token, onBack}) => {
         <div style={{display:"flex",alignItems:"center",gap:12}}>
           <span style={{fontSize:11,color:C.muted}}>{time} IST</span>
           <div style={{display:"flex",alignItems:"center",gap:6}}>
-            <MevionMark size={22}/>
-            <span style={{fontSize:18,fontWeight:900,color:C.red,letterSpacing:-1}}>mevion</span>
+            <img src="/mevion-logo.png" style={{height:44, width:"auto"}} alt="mevion"/>
           </div>
         </div>
       </header>
