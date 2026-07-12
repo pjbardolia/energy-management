@@ -43,12 +43,23 @@ const MACHINES = [
   { id:15, name:"Jet 28", cid:16, model:"INVT CHF100A",   slave:13 },
   { id:16, name:"Jet 29", cid:17, model:"INVT CHF100A",   slave:14 },
 ];
-const STOPPED = new Set([7, 12]); // Jet 02 and Jet 21 stopped at night
+
+// Keyed by machine.id — used to recover model/slave_id after live API merges.
+const MACHINES_MAP = Object.fromEntries(MACHINES.map(m => [m.id, m]));
 
 /* ═══════════════════════════════════════════════════════════════
    UTILITIES
 ═══════════════════════════════════════════════════════════════ */
 const rnd = (lo, hi, d=2) => parseFloat((Math.random()*(hi-lo)+lo).toFixed(d));
+
+// Format a sensor value safely.
+// Returns "—" for null/undefined (tag missing from response).
+// Returns the formatted number string for 0 and above.
+// Zero is a valid reading (idle VFD) — do not conflate with missing.
+const fmt = (val, dec = 1) => {
+  if (val === null || val === undefined) return "—";
+  return dec === 0 ? Math.round(val).toLocaleString() : parseFloat(val).toFixed(dec);
+};
 
 const toIST = (utcStr) => {
   if (!utcStr) return "—";
@@ -68,27 +79,31 @@ const nowIST = () =>
   });
 
 /* ═══════════════════════════════════════════════════════════════
-   MOCK DATA
-   TODO Phase 5c — replace buildFleet() with GET /machines/live
-                   replace buildHistory() with GET /machines/{id}/history
+   OFFLINE DEVELOPMENT ONLY
+   buildFleet() and buildHistory() generate synthetic data for UI
+   work without a backend connection.  They are no longer called in
+   production.  Do not remove — useful when iterating on layout
+   without a VPN or network.
 ═══════════════════════════════════════════════════════════════ */
+const STOPPED = new Set([7, 12]); // Jet 02 and Jet 21 stopped at night
+
 const buildFleet = () => MACHINES.map(m => {
   const on  = !STOPPED.has(m.id);
   const hz  = on ? rnd(27, 34) : 0;
   return {
-    machine_id: m.id,
-    machine_name: m.name,
-    cid:  m.cid,
-    model: m.model,
-    slave_id: m.slave,
-    updated: new Date(Date.now() - rnd(0,14000,0)).toISOString().slice(0,19),
+    machine_id:            m.id,
+    machine_name:          m.name,
+    component_instance_id: m.cid,
+    model:                 m.model,
+    slave_id:              m.slave,
+    last_updated: new Date(Date.now() - rnd(0,14000,0)).toISOString().slice(0,19),
     tags: {
-      frequency:      on ? hz          : 0,
-      current:        on ? rnd(4.5,8.5): 0,
-      power:          on ? rnd(18,35)  : 0,
+      frequency:      on ? hz               : 0,
+      current:        on ? rnd(4.5,8.5)     : 0,
+      power:          on ? rnd(18,35)       : 0,
       rpm:            on ? Math.round(hz*57.5) : 0,
-      torque:         on ? rnd(15,45)  : 0,
-      output_voltage: on ? rnd(240,295,1) : 0,
+      torque:         on ? rnd(15,45)       : 0,
+      output_voltage: on ? rnd(240,295,1)   : 0,
       dc_voltage:     rnd(555,582,1),
     },
   };
@@ -105,35 +120,58 @@ const buildHistory = (machineId) => {
     const hz = on ? 27 + Math.sin(i/8)*3 + rnd(-.4,.4) : 0;
     return {
       label,
-      frequency:      on ? parseFloat(hz.toFixed(2))                        : 0,
-      current:        on ? parseFloat((6+Math.sin(i/10)*1.5+rnd(-.3,.3)).toFixed(2)) : 0,
-      power:          on ? parseFloat((25+Math.sin(i/12)*5+rnd(-1,1)).toFixed(2))    : 0,
-      rpm:            on ? Math.round(hz*57.5)                              : 0,
-      output_voltage: on ? parseFloat((265+Math.sin(i/15)*10+rnd(-2,2)).toFixed(1))  : 0,
+      frequency:      on ? parseFloat(hz.toFixed(2))                                    : 0,
+      current:        on ? parseFloat((6+Math.sin(i/10)*1.5+rnd(-.3,.3)).toFixed(2))   : 0,
+      power:          on ? parseFloat((25+Math.sin(i/12)*5+rnd(-1,1)).toFixed(2))      : 0,
+      rpm:            on ? Math.round(hz*57.5)                                          : 0,
+      output_voltage: on ? parseFloat((265+Math.sin(i/15)*10+rnd(-2,2)).toFixed(1))    : 0,
       dc_voltage:     parseFloat((568+Math.sin(i/20)*8+rnd(-1,1)).toFixed(1)),
-      torque:         on ? parseFloat((30+Math.sin(i/9)*8+rnd(-2,2)).toFixed(1))     : 0,
+      torque:         on ? parseFloat((30+Math.sin(i/9)*8+rnd(-2,2)).toFixed(1))       : 0,
     };
   });
 };
 
 /* ═══════════════════════════════════════════════════════════════
-   AUTH
-   Real login works when deployed on same origin or with CORS set.
-   Use demo@mevion.com / demo inside the artifact preview.
+   AUTH & API HELPERS
 ═══════════════════════════════════════════════════════════════ */
 const tryLogin = async (email, password) => {
-  if (email === "demo@mevion.com" && password === "demo") return "DEMO_TOKEN";
+  // Offline dev shortcut — demo@mevion.com does not exist in the production DB:
+  // if (email === "demo@mevion.com" && password === "demo") return "DEMO_TOKEN";
   const res = await fetch(`${API_BASE}/login`, {
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({username:email, password}),
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ username: email, password }),
   });
   if (!res.ok) {
-    const err = await res.json().catch(()=>({}));
+    const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || "Invalid credentials");
   }
   return (await res.json()).access_token;
 };
+
+// Authenticated fetch wrapper.
+// On 401, throws an error with .status=401 so callers can trigger logout.
+// On other non-OK responses, throws a descriptive error.
+const apiFetch = async (path, token) => {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 401) {
+    const err = new Error("Session expired. Please sign in again.");
+    err.status = 401;
+    throw err;
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || `Server error ${res.status}`);
+  }
+  return res.json();
+};
+
+// Flatten { bucket, tags: { frequency: 30.1, ... } } → { label: "HH:MM:SS", frequency: 30.1, ... }
+// so Recharts dataKey={active} continues to work unchanged after the history shape change.
+const flattenHistory = (buckets) =>
+  (buckets || []).map(d => ({ label: toIST(d.bucket), ...(d.tags || {}) }));
 
 /* ═══════════════════════════════════════════════════════════════
    STATUS DOT — pulse animation for running machines
@@ -155,7 +193,6 @@ const Dot = ({on}) => (
   </span>
 );
 
-
 /* ═══════════════════════════════════════════════════════════════
    LOGIN PAGE
 ═══════════════════════════════════════════════════════════════ */
@@ -172,7 +209,7 @@ const LoginPage = ({onLogin}) => {
       const tok = await tryLogin(email, pass);
       onLogin(tok);
     } catch(e) {
-      setError(e.message || "Login failed. Use demo@mevion.com / demo to preview.");
+      setError(e.message || "Login failed");
     } finally { setLoading(false); }
   };
 
@@ -255,15 +292,6 @@ const LoginPage = ({onLogin}) => {
         }}>
           {loading ? "Signing in…" : "Sign in"}
         </button>
-
-        <div style={{
-          marginTop:16, padding:"12px 14px",
-          background:C.bg, borderRadius:8,
-          fontSize:12, color:C.muted, lineHeight:1.7,
-        }}>
-          <strong style={{color:C.text,fontWeight:600}}>Demo preview</strong><br/>
-          demo@mevion.com&nbsp;/&nbsp;demo
-        </div>
       </div>
 
       <p style={{marginTop:28,fontSize:12,color:C.muted}}>
@@ -277,7 +305,7 @@ const LoginPage = ({onLogin}) => {
    MACHINE TILE
 ═══════════════════════════════════════════════════════════════ */
 const Tile = ({machine, onClick}) => {
-  const on = machine.tags.frequency > 0;
+  const on = (machine.tags?.frequency ?? 0) > 0;
   const [hov, setHov] = useState(false);
 
   return (
@@ -310,13 +338,13 @@ const Tile = ({machine, onClick}) => {
         </div>
       </div>
 
-      {/* Metrics 2×2 */}
+      {/* Metrics 2×2 — fmt() returns "—" for missing tags, number string for 0 and above */}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px 14px",marginBottom:11}}>
         {[
-          {label:"Frequency", val:machine.tags.frequency.toFixed(1), unit:"Hz", big:true,  accent:true  },
-          {label:"Power",     val:machine.tags.power.toFixed(1),     unit:"kW", big:true,  accent:true  },
-          {label:"Current",   val:machine.tags.current.toFixed(1),   unit:"A",  big:false, accent:false },
-          {label:"RPM",       val:machine.tags.rpm.toLocaleString(), unit:"",   big:false, accent:false },
+          {label:"Frequency", val:fmt(machine.tags?.frequency),  unit:"Hz", big:true,  accent:true  },
+          {label:"Power",     val:fmt(machine.tags?.power),      unit:"kW", big:true,  accent:true  },
+          {label:"Current",   val:fmt(machine.tags?.current),    unit:"A",  big:false, accent:false },
+          {label:"RPM",       val:fmt(machine.tags?.rpm, 0),     unit:"",   big:false, accent:false },
         ].map(m=>(
           <div key={m.label}>
             <div style={{fontSize:10,color:C.muted,fontWeight:500,marginBottom:1}}>{m.label}</div>
@@ -329,7 +357,7 @@ const Tile = ({machine, onClick}) => {
               lineHeight:1.1,
             }}>
               {on ? m.val : "—"}
-              {on && m.unit && (
+              {on && m.val !== "—" && m.unit && (
                 <span style={{fontSize:10,fontWeight:400,color:C.muted,marginLeft:2}}>{m.unit}</span>
               )}
             </div>
@@ -342,7 +370,7 @@ const Tile = ({machine, onClick}) => {
         borderTop:`1px solid ${C.border}`,paddingTop:9,
         fontSize:10,color:C.muted,
       }}>
-        Updated {toIST(machine.updated)} IST
+        Updated {toIST(machine.last_updated)} IST
       </div>
     </div>
   );
@@ -353,27 +381,48 @@ const Tile = ({machine, onClick}) => {
 ═══════════════════════════════════════════════════════════════ */
 const FleetDashboard = ({token, onLogout, onSelect}) => {
   const [fleet, setFleet]     = useState([]);
+  const [summary, setSummary] = useState({
+    total_machines: 0, running: 0, stopped: 0, total_power_kw: 0, last_updated: null,
+  });
   const [time, setTime]       = useState(nowIST());
   const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState(null);
 
-  const refresh = useCallback(() => {
-    // TODO Phase 5c: replace with:
-    // fetch(`${API_BASE}/machines/live`, {headers:{Authorization:`Bearer ${token}`}})
-    //   .then(r=>r.json()).then(data=>{ setFleet(data); ... });
-    setFleet(buildFleet());
-    setTime(nowIST());
-    setLoading(false);
-  }, [token]);
+  const refresh = useCallback(async () => {
+    try {
+      const [liveData, summaryData] = await Promise.all([
+        apiFetch("/machines/live", token),
+        apiFetch("/fleet/summary", token),
+      ]);
+      // Merge API rows with MACHINES master list.
+      // Machines absent from the API (no telemetry yet, e.g. loose RS485 ferrule)
+      // appear in the grid with empty tags — visible as STOPPED with "—" readings.
+      const byId = Object.fromEntries(liveData.map(m => [m.machine_id, m]));
+      const merged = MACHINES.map(m => {
+        const api = byId[m.id];
+        return api
+          ? { ...api, model: m.model, slave_id: m.slave }
+          : { machine_id: m.id, machine_name: m.name,
+              component_instance_id: m.cid, model: m.model,
+              slave_id: m.slave, last_updated: null, tags: {} };
+      });
+      setFleet(merged);
+      setSummary(summaryData);
+      setError(null);
+    } catch (e) {
+      if (e.status === 401) { onLogout(); return; }
+      setError(e.message || "API unreachable");
+    } finally {
+      setLoading(false);
+      setTime(nowIST());
+    }
+  }, [token, onLogout]);
 
   useEffect(() => {
     refresh();
     const iv = setInterval(refresh, POLL_MS);
     return () => clearInterval(iv);
   }, [refresh]);
-
-  const running    = fleet.filter(m=>m.tags.frequency>0).length;
-  const stopped    = fleet.length - running;
-  const totalPower = fleet.reduce((s,m)=>s+m.tags.power,0);
 
   return (
     <div style={{
@@ -416,13 +465,13 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
       </header>
 
       <main style={{padding:"20px 24px", maxWidth:1440, margin:"0 auto"}}>
-        {/* KPI bar */}
+        {/* KPI bar — values from /fleet/summary; total shows server count / master count */}
         <div className="ks" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:20}}>
           {[
-            {label:"Total machines", val:fleet.length,            unit:"",   color:C.text},
-            {label:"Running",        val:running,                  unit:"",   color:C.running},
-            {label:"Stopped",        val:stopped,                  unit:"",   color:C.stopped},
-            {label:"Total power",    val:totalPower.toFixed(1),    unit:"kW", color:C.red},
+            {label:"Total machines", val:`${summary.total_machines} / ${MACHINES.length}`, unit:"",   color:C.text   },
+            {label:"Running",        val:summary.running,                                   unit:"",   color:C.running},
+            {label:"Stopped",        val:summary.stopped,                                   unit:"",   color:C.stopped},
+            {label:"Total power",    val:(summary.total_power_kw ?? 0).toFixed(1),          unit:"kW", color:C.red    },
           ].map(k=>(
             <div key={k.label} style={{
               background:C.white, borderRadius:12, padding:"18px 20px",
@@ -437,6 +486,19 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
           ))}
         </div>
 
+        {/* Error banner — shown when a poll fails; keeps last known grid visible */}
+        {error && (
+          <div style={{
+            background:"#FFF5F5", border:"1px solid #FECACA", borderRadius:8,
+            padding:"10px 16px", marginBottom:14,
+            color:C.red, fontSize:13,
+            display:"flex", justifyContent:"space-between", alignItems:"center",
+          }}>
+            <span>⚠ {error}</span>
+            <span style={{color:C.muted, fontSize:11}}>Retrying in 10 s</span>
+          </div>
+        )}
+
         {/* Section label */}
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:13}}>
           <h2 style={{fontSize:13,fontWeight:700,color:C.text,margin:0,textTransform:"uppercase",letterSpacing:.5}}>
@@ -448,6 +510,8 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
         {/* Grid */}
         {loading ? (
           <div style={{textAlign:"center",padding:60,color:C.muted}}>Loading fleet data…</div>
+        ) : fleet.length === 0 && error ? (
+          <div style={{textAlign:"center",padding:60,color:C.red}}>{error}</div>
         ) : (
           <div className="fg" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14}}>
             {fleet.map(m=>(
@@ -473,30 +537,50 @@ const METRICS_DEF = [
   {key:"torque",         label:"Torque",           unit:"%",  color:"#DB2777", dec:1 },
 ];
 
-const JetDetail = ({machine, token, onBack}) => {
+const JetDetail = ({machine, token, onBack, onLogout}) => {
   const [live, setLive]       = useState(machine);
   const [hist, setHist]       = useState([]);
   const [active, setActive]   = useState("frequency");
   const [time, setTime]       = useState(nowIST());
+  const [error, setError]     = useState(null);
 
-  const on  = live.tags.frequency > 0;
+  const on  = (live.tags?.frequency ?? 0) > 0;
   const met = METRICS_DEF.find(m=>m.key===active) || METRICS_DEF[0];
 
-  useEffect(()=>{
-    setHist(buildHistory(machine.machine_id));
-    const iv = setInterval(()=>{
-      // TODO Phase 5c: replace with real GET /machines/{id}/live and /history
-      const updated = buildFleet().find(m=>m.machine_id===machine.machine_id);
-      if (updated) setLive(updated);
-      setHist(buildHistory(machine.machine_id));
-      setTime(nowIST());
-    }, POLL_MS);
-    return ()=>clearInterval(iv);
-  }, [machine]);
+  useEffect(() => {
+    let cancelled = false;
 
+    const fetchAll = async () => {
+      try {
+        const [liveData, histData] = await Promise.all([
+          apiFetch(`/machines/${machine.machine_id}/live`, token),
+          apiFetch(`/machines/${machine.machine_id}/history?hours=1`, token),
+        ]);
+        if (cancelled) return;
+        // Recover model/slave_id from master list — not present in the live API response.
+        const master = MACHINES_MAP[machine.machine_id] || {};
+        setLive({ ...liveData, model: master.model, slave_id: master.slave });
+        setHist(flattenHistory(histData.data));
+        setError(null);
+      } catch (e) {
+        if (cancelled) return;
+        if (e.status === 401) { onLogout(); return; }
+        setError(e.message || "API unreachable");
+      }
+      if (!cancelled) setTime(nowIST());
+    };
+
+    fetchAll();
+    const iv = setInterval(fetchAll, POLL_MS);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [machine.machine_id, token, onLogout]);
+
+  // fmt here is scoped to JetDetail to handle the "alive" check:
+  // dc_voltage is shown even when frequency=0 (machine stopped but powered).
+  // It intentionally shadows the module-level fmt — JetDetail needs metric context.
   const fmt = (m, val) => {
-    const alive = on || m.key==="dc_voltage";
-    if (!alive || val===undefined || val===null) return "—";
+    const alive = on || m.key === "dc_voltage";
+    if (!alive || val === undefined || val === null) return "—";
     if (m.int) return Math.round(val).toLocaleString();
     return parseFloat(val).toFixed(m.dec);
   };
@@ -556,15 +640,23 @@ const JetDetail = ({machine, token, onBack}) => {
             padding:"3px 10px", borderRadius:6, fontWeight:500,
           }}>{machine.model}</span>
           <span style={{fontSize:12,color:C.muted}}>
-            Slave {machine.slave_id} · Last seen {toIST(live.updated)} IST
+            Slave {machine.slave_id} · Last seen {toIST(live.last_updated)} IST
           </span>
         </div>
+
+        {/* Error banner — keeps last known data visible with a clear warning */}
+        {error && (
+          <div style={{
+            background:"#FFF5F5", border:"1px solid #FECACA", borderRadius:8,
+            padding:"10px 16px", marginBottom:14, color:C.red, fontSize:13,
+          }}>⚠ {error} — showing last known data</div>
+        )}
 
         {/* Metrics row */}
         <div className="mr" style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:12,marginBottom:20}}>
           {METRICS_DEF.map(m=>{
             const isAct = active===m.key;
-            const val   = live.tags[m.key];
+            const val   = live.tags?.[m.key];
             const alive = on || m.key==="dc_voltage";
             return (
               <div
@@ -583,7 +675,7 @@ const JetDetail = ({machine, token, onBack}) => {
                   fontVariantNumeric:"tabular-nums", letterSpacing:-.2,
                 }}>
                   {fmt(m,val)}
-                  {alive && val!==undefined && m.unit && (
+                  {alive && val !== undefined && val !== null && m.unit && (
                     <span style={{fontSize:10,fontWeight:400,color:C.muted,marginLeft:2}}>{m.unit}</span>
                   )}
                 </div>
@@ -607,11 +699,13 @@ const JetDetail = ({machine, token, onBack}) => {
               fontSize:28, fontWeight:900, color:met.color,
               fontVariantNumeric:"tabular-nums", letterSpacing:-1,
             }}>
-              {fmt(met,live.tags[met.key])}
+              {fmt(met, live.tags?.[met.key])}
               <span style={{fontSize:13,fontWeight:400,color:C.muted,marginLeft:4}}>{met.unit}</span>
             </div>
           </div>
 
+          {/* flattenHistory maps { bucket, tags:{...} } → { label, frequency, power, ... }
+              so dataKey={active} reads the right field without any chart code changes. */}
           <ResponsiveContainer width="100%" height={250}>
             <AreaChart data={hist} margin={{top:4,right:8,left:-8,bottom:0}}>
               <defs>
@@ -646,29 +740,32 @@ const JetDetail = ({machine, token, onBack}) => {
    APP ROOT
 ═══════════════════════════════════════════════════════════════ */
 export default function App() {
-  const [page, setPage]       = useState("login");
-  const [token, setToken]     = useState(null);
-  const [sel, setSel]         = useState(null);
+  const [page, setPage]   = useState("login");
+  const [token, setToken] = useState(null);
+  const [sel, setSel]     = useState(null);
 
-  if (page==="login")
-    return <LoginPage onLogin={t=>{setToken(t);setPage("fleet");}}/>;
+  const logout = () => { setToken(null); setPage("login"); setSel(null); };
 
-  if (page==="fleet")
+  if (page === "login")
+    return <LoginPage onLogin={t => { setToken(t); setPage("fleet"); }}/>;
+
+  if (page === "fleet")
     return (
       <FleetDashboard
         token={token}
-        onLogout={()=>{setToken(null);setPage("login");setSel(null);}}
-        onSelect={m=>{setSel(m);setPage("detail");}}
+        onLogout={logout}
+        onSelect={m => { setSel(m); setPage("detail"); }}
       />
     );
 
-  if (page==="detail" && sel)
+  if (page === "detail" && sel)
     return (
       <JetDetail
         machine={sel} token={token}
-        onBack={()=>{setSel(null);setPage("fleet");}}
+        onBack={() => { setSel(null); setPage("fleet"); }}
+        onLogout={logout}
       />
     );
 
-  return <LoginPage onLogin={t=>{setToken(t);setPage("fleet");}}/>;
+  return <LoginPage onLogin={t => { setToken(t); setPage("fleet"); }}/>;
 }
