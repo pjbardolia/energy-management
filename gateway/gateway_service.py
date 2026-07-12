@@ -10,9 +10,9 @@ Architecture (ADR-006):
 Supported VFD models (register maps are defined in VFD_REGISTER_MAPS below —
 they are hardware specs, not deployment config, so they live in code):
   - INVT_CHF100A  : 8 registers at 0x3000
-  - YASKAWA_A1000 : 6 registers at 0x0023
-  - YASKAWA_V1000 : 6 registers at 0x0023  (identical layout to A1000)
-  - YASKAWA_F7    : 5 registers at 0x0023
+  - YASKAWA_A1000 : 36 registers at 0x0023 (idx 1=Hz, 2=V, 3=A, 4=kW, 35=Vdc)
+  - YASKAWA_V1000 : same spec as A1000
+  - YASKAWA_F7    : same spec as A1000
 
 Device roster (which slave ID maps to which model and component_instance_id)
 and all RS485/API parameters live in config.json — no code changes are needed
@@ -118,30 +118,48 @@ _INVT_CHF100A_SPEC = {
 # Note: register [5] holds a speed/rpm value but it is not reliable on this
 # installation — tag_name is None so it is read as part of the block but
 # never stored in the database.
-_YASKAWA_A1000_V1000_SPEC = {
-    "address": 0x0023,
-    "count": 6,
-    "registers": [
-        ("frequency",      0, 100),  # Output frequency  / 100 → Hz
-        ("output_voltage", 1, 10),   # Output voltage    / 10  → V
-        ("current",        2, 100),  # Output current    / 100 → A  (0.01 A resolution)
-        ("power",          3, 10),   # Output power      / 10  → kW
-        ("dc_voltage",     4, 1),    # DC bus voltage    raw   → V
-        (None,             5, 1),    # Speed/RPM — not available on this installation
-    ],
-}
-
-# Yaskawa F7 — 5 consecutive registers starting at 0x0023.
-# Source: Yaskawa F7 technical manual, U1-xx monitor parameters.
-_YASKAWA_F7_SPEC = {
+_YASKAWA_SPEC = {
+    # Yaskawa MEMOBUS monitor registers — A1000 / V1000 / F7.
+    #
+    # *** Verified against the VFD front panel on 2026-07-12 (Jet 16, slave 3) ***
+    # 0x0023 is the frequency REFERENCE (setpoint), NOT the output frequency.
+    # The previous spec started here and mapped fields sequentially, which
+    # shifted every label one register late:
+    #   - output voltage (308.2 V) was reported as current (30.82 A)
+    #   - output current (4.0 A)   was reported as power   (4.0 kW)
+    # Frequency appeared correct only because at setpoint the reference
+    # equals the output. Do NOT "simplify" this back to a contiguous
+    # 5-register read from index 0 — the off-by-one returns silently.
+    #
+    # Single read of 36 registers (0x0023..0x0046); indices are offsets.
+    #
+    #   idx  addr    monitor  meaning              scale
+    #    0   0x0023  U1-01    frequency reference  (not stored)
+    #    1   0x0024  U1-02    output frequency     /100 -> Hz
+    #    2   0x0025  U1-06    output voltage       /10  -> V
+    #    3   0x0026  U1-03    output current       /10  -> A
+    #    4   0x0027  U1-08    output power         /100 -> kW
+    #   35   0x0046  U1-07    DC bus voltage       x1   -> V
+    #
+    # rpm and torque are NOT mapped. 0x0042 does not decode to either under
+    # any scaling that matches the panel. Unmapped renders as an em-dash;
+    # wrong renders as a plausible lie.
+    # NOTE: the A1000 rejects reads longer than ~16 registers with Modbus
+    # exception 3 (Illegal Data Value). Verified on the wire 2026-07-12:
+    # count=12 succeeds, count=24 and count=36 both fail. dc_voltage (0x0046)
+    # therefore CANNOT be folded into this block and needs its own read.
+    # Do NOT "optimize" these back into a single transaction.
     "address": 0x0023,
     "count": 5,
     "registers": [
-        ("frequency",      0, 100),  # Output frequency  / 100 → Hz
-        ("output_voltage", 1, 10),   # Output voltage    / 10  → V
-        ("current",        2, 100),  # Output current    / 100 → A  (0.01 A resolution)
-        ("power",          3, 10),   # Output power      / 10  → kW
-        ("dc_voltage",     4, 1),    # DC bus voltage    raw   → V
+        ("frequency",      1, 100),
+        ("output_voltage", 2,  10),
+        ("current",        3,  10),
+        ("power",          4, 100),
+    ],
+    "extra_reads": [
+        {"address": 0x0046, "count": 1,
+         "registers": [("dc_voltage", 0, 1)]},
     ],
 }
 
@@ -150,9 +168,9 @@ _YASKAWA_F7_SPEC = {
 # kept as separate model names so the device list is self-documenting.
 VFD_REGISTER_MAPS = {
     "INVT_CHF100A":   _INVT_CHF100A_SPEC,
-    "YASKAWA_A1000":  _YASKAWA_A1000_V1000_SPEC,
-    "YASKAWA_V1000":  _YASKAWA_A1000_V1000_SPEC,   # same layout as A1000
-    "YASKAWA_F7":     _YASKAWA_F7_SPEC,
+    "YASKAWA_A1000": _YASKAWA_SPEC,
+    "YASKAWA_V1000": _YASKAWA_SPEC,   # same layout as A1000
+    "YASKAWA_F7":    _YASKAWA_SPEC,
 }
 
 
@@ -614,6 +632,32 @@ def read_modbus(
         values.get("current", 0.0),
         len(values),
     )
+
+    # Some models keep a value outside the main block (e.g. Yaskawa dc_voltage
+    # at 0x0046 — the drive rejects a read long enough to reach it). Each
+    # extra read is its own Modbus transaction. A failure here is non-fatal:
+    # log it and return the values we did get, rather than dropping the whole
+    # device for the cycle.
+    for extra in spec.get("extra_reads", []):
+        try:
+            er = client.read_holding_registers(
+                address=extra["address"],
+                count=extra["count"],
+                device_id=slave_id,
+            )
+        except ModbusIOException as exc:
+            log.warning("Slave %d [%s]: extra read at 0x%04X failed: %s",
+                        slave_id, vfd_model, extra["address"], exc)
+            continue
+        if er.isError():
+            log.warning("Slave %d [%s]: extra read at 0x%04X error: %s",
+                        slave_id, vfd_model, extra["address"], er)
+            continue
+        for tag_name, reg_index, divisor in extra["registers"]:
+            if tag_name is None:
+                continue
+            values[tag_name] = er.registers[reg_index] / divisor
+
     return values
 
 
