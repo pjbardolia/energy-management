@@ -21,7 +21,7 @@ const C = {
 const POLL_MS  = 10_000;
 // In dev the Vite proxy forwards /api → http://165.22.247.235:8001 (strips /api prefix).
 // In production the built bundle talks directly to the API server.
-const API_BASE = import.meta.env.DEV ? "/api" : "http://165.22.247.235:8001";
+const API_BASE = "/api";
 
 /* ═══════════════════════════════════════════════════════════════
    MACHINE MASTER DATA
