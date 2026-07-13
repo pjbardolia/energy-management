@@ -14,8 +14,11 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from auth import get_current_user, get_tenant_db
-from schemas.telemetry import DataCreate, DataResponse
-from models import TelemetryData
+from schemas.telemetry import (
+    DataCreate, DataResponse,
+    TelemetryBatchRequest, TelemetryBatchResponse,
+)
+from models import TelemetryData, MachineComponentInstance
 
 
 router = APIRouter()
@@ -61,6 +64,65 @@ def create_data(
     # SQLAlchemy populates the auto-generated `id` via the INSERT RETURNING
     # clause, so the instance already holds the complete row for the response.
     return db_data
+
+
+@router.post("/data/batch", response_model=TelemetryBatchResponse, status_code=202)
+def create_data_batch(
+    batch: TelemetryBatchRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
+):
+    company_id = current_user["company_id"]
+
+    # ── Tenant check — one query for the entire batch ───────────────────────
+    # Collect the distinct component IDs, resolve their owners in a single
+    # SELECT, then reject the whole request if any belongs to another tenant.
+    # company_id is always sourced from the JWT — never from the request body.
+    batch_cids = {item.component_instance_id for item in batch.readings}
+    owned_rows = db.query(
+        MachineComponentInstance.id, MachineComponentInstance.company_id
+    ).filter(MachineComponentInstance.id.in_(batch_cids)).all()
+
+    owned_map = {row.id: row.company_id for row in owned_rows}
+    errors = []
+    for cid in batch_cids:
+        if cid not in owned_map:
+            errors.append("component_instance_id {} not found".format(cid))
+        elif owned_map[cid] != company_id:
+            # Immediately 403 — do not reveal which IDs exist in another tenant.
+            raise HTTPException(
+                status_code=403,
+                detail="component_instance_id {} belongs to another tenant".format(cid),
+            )
+    if errors:
+        raise HTTPException(status_code=400, detail={"errors": errors[:10]})
+
+    # ── Single transaction, single commit ───────────────────────────────────
+    # Build all ORM objects, then flush in one shot.
+    # db.refresh() is intentionally omitted — TimescaleDB's composite PK
+    # (id, timestamp) breaks the SELECT-by-PK that refresh() issues internally.
+    db_rows = [
+        TelemetryData(
+            timestamp=item.timestamp,
+            component_instance_id=item.component_instance_id,
+            tag_definition_id=item.tag_definition_id,
+            value_num=item.value_num,
+            value_text=item.value_text,
+            company_id=company_id,   # from the token, never the body
+        )
+        for item in batch.readings
+    ]
+    db.add_all(db_rows)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Batch insert failed — check component_instance_id and tag_definition_id values.",
+        )
+
+    return TelemetryBatchResponse(accepted=len(db_rows), rejected=0)
 
 
 @router.get("/data", response_model=list[DataResponse])

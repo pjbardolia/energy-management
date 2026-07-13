@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DataCreate(BaseModel):
@@ -39,3 +39,24 @@ class DataResponse(BaseModel):
 
     class Config:
         from_attributes = True  # lets Pydantic read SQLAlchemy ORM objects directly
+
+
+class TelemetryBatchItem(BaseModel):
+    # Mirror DataCreate exactly, minus company_id — the server reads it from the JWT.
+    timestamp: datetime
+    component_instance_id: int
+    tag_definition_id: int
+    value_num: Optional[float] = None
+    value_text: Optional[str] = None
+
+
+class TelemetryBatchRequest(BaseModel):
+    # min_length=1 → Pydantic returns 422 on an empty array before the endpoint runs.
+    # max_length=500 caps payload size so a malformed client can't send 10 MB.
+    readings: list[TelemetryBatchItem] = Field(..., min_length=1, max_length=500)
+
+
+class TelemetryBatchResponse(BaseModel):
+    accepted: int
+    rejected: int
+    errors: list[str] = []

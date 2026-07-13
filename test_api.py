@@ -561,6 +561,104 @@ record("GET /fleet/summary", status, summary_ok,
            (parsed or {}).get("running", "?"),
        ))
 
+# ===========================================================================
+# Batch telemetry ingest (Phase 5d)
+# ===========================================================================
+
+# 39) POST /data/batch — 50 valid readings → 202, accepted == 50 ───────────
+freq_tag_id = tag_ids.get("frequency")
+if component_id and freq_tag_id and token:
+    batch_readings = [
+        {
+            "timestamp":             "2026-06-28T{:02d}:{:02d}:00".format(i // 60, i % 60),
+            "component_instance_id": component_id,
+            "tag_definition_id":     freq_tag_id,
+            "value_num":             49.0 + (i * 0.02),
+        }
+        for i in range(50)
+    ]
+    status, raw, parsed = request(
+        "POST", "/data/batch", {"readings": batch_readings}, token=token
+    )
+    batch_ok = (
+        status == 202
+        and isinstance(parsed, dict)
+        and parsed.get("accepted") == 50
+    )
+    record("POST /data/batch (50 valid rows)", status, batch_ok,
+           "accepted={}".format((parsed or {}).get("accepted", "?")) if parsed else raw[:90])
+else:
+    record("POST /data/batch (50 valid rows)", None, False,
+           "skipped: missing component_id, freq_tag_id, or token")
+
+# 40) POST /data/batch cross-tenant → 403 ─────────────────────────────────
+# Create a second test company + user so we have a token from a different tenant.
+# Then use company-1's component_id with that foreign token — must return 403.
+company2_id = None
+token2 = None
+if component_id and freq_tag_id:
+    _s, _, _p = request(
+        "POST", "/companies",
+        {"company_name": "Test Factory B " + suffix, "address": "456 Test Ave"},
+    )
+    company2_id = _p.get("id") if isinstance(_p, dict) and _s == 201 else None
+
+    if company2_id:
+        _s, _, _p = request(
+            "POST", "/users",
+            {"username": "tester_b_" + suffix, "password": "Test1234",
+             "role": "admin", "company_id": company2_id},
+        )
+        if _s == 201:
+            _s, _, _p = request(
+                "POST", "/login",
+                {"username": "tester_b_" + suffix, "password": "Test1234"},
+            )
+            token2 = _p.get("access_token") if isinstance(_p, dict) and _s == 200 else None
+
+    if token2:
+        status, raw, parsed = request(
+            "POST", "/data/batch",
+            {"readings": [{
+                "timestamp":             "2026-06-28T15:00:00",
+                "component_instance_id": component_id,   # owned by company 1
+                "tag_definition_id":     freq_tag_id,
+                "value_num":             30.0,
+            }]},
+            token=token2,   # authenticated as company 2
+        )
+        record("POST /data/batch (cross-tenant → 403)", status, status == 403, raw[:90])
+    else:
+        record("POST /data/batch (cross-tenant → 403)", None, False,
+               "skipped: could not set up second test company/user")
+else:
+    record("POST /data/batch (cross-tenant → 403)", None, False,
+           "skipped: no component_id or freq_tag_id")
+
+# 41) POST /data/batch empty array → 422 (Pydantic min_length=1) ──────────
+status, raw, parsed = request(
+    "POST", "/data/batch", {"readings": []}, token=token
+)
+record("POST /data/batch (empty → 422)", status, status == 422, raw[:60])
+
+# 42) POST /data backward compat — existing single-row endpoint unchanged ──
+if effective_company_id and component_id and freq_tag_id and token:
+    status, raw, parsed = request(
+        "POST", "/data",
+        {
+            "timestamp":             "2026-06-28T16:00:00",
+            "component_instance_id": component_id,
+            "tag_definition_id":     freq_tag_id,
+            "value_num":             50.0,
+            "company_id":            effective_company_id,
+        },
+        token=token,
+    )
+    record("POST /data (backward compat)", status, status == 201, raw[:90])
+else:
+    record("POST /data (backward compat)", None, False,
+           "skipped: missing required IDs")
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

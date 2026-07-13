@@ -37,7 +37,7 @@ import os
 import sqlite3
 import time
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from pymodbus.client import ModbusSerialClient
@@ -281,6 +281,11 @@ _OUTBOX_DB = os.path.join(_SCRIPT_DIR, "outbox.db")
 # and never retried — prevents infinite retry of a corrupt or rejected payload.
 MAX_RETRIES = 10
 
+# Number of outbox rows bundled into a single POST /data/batch request.
+# At ~340 ms round-trip, 200 rows per request raises throughput from
+# ~2.9 rows/s (one POST per row) to 500+ rows/s.
+BATCH_SIZE = 200
+
 
 def init_outbox():
     """Create the outbox table if it does not already exist.
@@ -359,24 +364,92 @@ def get_retry_count(row_id: int) -> int:
     return row[0] if row else 0
 
 
-def fetch_unsent() -> list:
-    """Return unsent rows eligible for retry, ordered oldest-first.
+def fetch_unsent(limit: int = 0) -> list:
+    """Return unsent rows eligible for retry, ordered oldest-first (by id).
 
     Rows with retry_count >= MAX_RETRIES are excluded — they have been
     permanently failed and logged.
+
+    Args:
+        limit: Maximum rows to return.  0 (default) returns all unsent rows.
+               Pass BATCH_SIZE to cap a single forward cycle.
 
     Returns:
         List of (id, payload_json) tuples.
     """
     conn = sqlite3.connect(_OUTBOX_DB)
-    rows = conn.execute(
-        "SELECT id, payload FROM outbox "
-        "WHERE sent_at IS NULL AND retry_count < ? "
-        "ORDER BY created_at ASC",
-        (MAX_RETRIES,),
-    ).fetchall()
+    if limit > 0:
+        rows = conn.execute(
+            "SELECT id, payload FROM outbox "
+            "WHERE sent_at IS NULL AND retry_count < ? "
+            "ORDER BY id ASC LIMIT ?",
+            (MAX_RETRIES, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, payload FROM outbox "
+            "WHERE sent_at IS NULL AND retry_count < ? "
+            "ORDER BY id ASC",
+            (MAX_RETRIES,),
+        ).fetchall()
     conn.close()
     return rows
+
+
+def count_unsent() -> int:
+    """Return the number of outbox rows still waiting to be sent.
+
+    Used after a successful batch flush to log the remaining backlog.
+    That single number is the health signal: if it climbs, the forwarder
+    is falling behind.
+    """
+    conn = sqlite3.connect(_OUTBOX_DB)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM outbox WHERE sent_at IS NULL AND retry_count < ?",
+        (MAX_RETRIES,),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def mark_batch_sent(row_ids: list):
+    """Mark a batch of rows sent in a single UPDATE inside one transaction.
+
+    Only called after the server returns 2xx — if the process dies between
+    the HTTP response and this UPDATE, the rows stay unsent and are re-sent
+    on the next cycle (duplicates are far better than lost data).
+    """
+    if not row_ids:
+        return
+    placeholders = ",".join("?" * len(row_ids))
+    conn = sqlite3.connect(_OUTBOX_DB)
+    conn.execute(
+        "UPDATE outbox SET sent_at = ? WHERE id IN ({})".format(placeholders),
+        # datetime.now(timezone.utc) is the non-deprecated replacement for utcnow()
+        [datetime.now(timezone.utc).isoformat()] + list(row_ids),
+    )
+    conn.commit()
+    conn.close()
+
+
+def increment_retry_batch(row_ids: list):
+    """Increment retry_count for a batch of rows in a single UPDATE.
+
+    Used only for 4xx responses on single-row fallback sends — never on a
+    full 200-row batch, to avoid silently expiring the entire backlog.
+    """
+    if not row_ids:
+        return
+    placeholders = ",".join("?" * len(row_ids))
+    conn = sqlite3.connect(_OUTBOX_DB)
+    conn.execute(
+        "UPDATE outbox SET retry_count = retry_count + 1 WHERE id IN ({})".format(
+            placeholders
+        ),
+        list(row_ids),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -459,106 +532,199 @@ class TokenManager:
 # COMPONENT 4 — HTTPS forwarder
 # ---------------------------------------------------------------------------
 
-def forward_outbox(token_manager: TokenManager, api_base_url: str):
-    """Send all pending outbox rows to POST /data on the cloud API.
+def _fallback_send_one_by_one(
+    row_ids: list,
+    readings: list,
+    token_manager: TokenManager,
+    api_base_url: str,
+):
+    """Send each row individually after a batch 4xx to isolate the bad row.
 
-    Processing order: oldest rows first (created_at ASC) so data arrives in
-    chronological order even after a backlog accumulates during an outage.
+    A 4xx on a 200-row batch does not mean all 200 rows are bad — one corrupt
+    row can poison the whole payload.  Incrementing retry_count on all 200
+    would silently expire the entire backlog after MAX_RETRIES cycles.
 
-    Behaviour on each response code:
-    - 201 Created       → mark_sent(), continue to next row
-    - 401 Unauthorized  → on_401() + one retry; if retry also fails, increment
-                          retry_count and continue to the next row
-    - Any other 4xx/5xx → increment retry_count, log warning, continue
-    - ConnectionError / Timeout → log warning, STOP this cycle (network is
-                          down; no point trying more rows until next poll)
+    This function re-sends each row as a single-item batch.  Good rows are
+    marked sent normally; only the genuinely bad row gets its retry_count
+    incremented.  This path is slow (one round-trip per row) but only runs
+    on error, so it does not affect steady-state throughput.
     """
-    url = api_base_url.rstrip("/") + "/data"
-    rows = fetch_unsent()
-
-    if not rows:
-        log.debug("Outbox is empty — nothing to forward")
-        return
-
-    log.debug("Forwarding %d pending outbox row(s)", len(rows))
-
-    for row_id, payload_json in rows:
-        payload = json.loads(payload_json)
-
-        # ── Attempt to send this row ────────────────────────────────────
+    url = api_base_url.rstrip("/") + "/data/batch"
+    for row_id, reading in zip(row_ids, readings):
         try:
             token = token_manager.get_token()
             resp = requests.post(
                 url,
-                json=payload,
+                json={"readings": [reading]},
                 headers={"Authorization": "Bearer " + token},
                 timeout=10,
             )
         except requests.exceptions.ConnectionError:
-            # Network is unreachable — no point trying remaining rows.
-            # All unsent rows stay in outbox and are retried next cycle.
             log.warning(
-                "Network unreachable — stopping forward cycle, "
-                "will retry at next poll"
+                "Network unreachable during per-row fallback — stopping"
             )
             return
         except requests.exceptions.Timeout:
-            log.warning("Request timed out for outbox row %d", row_id)
-            increment_retry(row_id)
-            return   # also stop on timeout; may signal a wider network issue
-
-        # ── Handle response ─────────────────────────────────────────────
-        if resp.status_code == 201:
-            mark_sent(row_id)
-            log.info(
-                "Sent outbox row %d — component=%s  tag=%s  value_num=%s",
-                row_id,
-                payload.get("component_instance_id"),
-                payload.get("tag_definition_id"),
-                payload.get("value_num"),
+            log.warning(
+                "Timeout during per-row fallback for row %d — stopping", row_id
             )
+            return
+
+        if resp.status_code in (200, 201, 202):
+            mark_sent(row_id)
 
         elif resp.status_code == 401:
-            # Token rejected — force re-login and retry this exact row once.
             token_manager.on_401()
             try:
                 new_token = token_manager.get_token()
                 resp2 = requests.post(
                     url,
-                    json=payload,
+                    json={"readings": [reading]},
                     headers={"Authorization": "Bearer " + new_token},
                     timeout=10,
                 )
-                if resp2.status_code == 201:
+                if resp2.status_code in (200, 201, 202):
                     mark_sent(row_id)
-                    log.info("Sent outbox row %d after re-authentication", row_id)
                 else:
                     increment_retry(row_id)
                     log.warning(
-                        "Row %d failed after re-authentication: HTTP %d — %s",
-                        row_id, resp2.status_code, resp2.text[:200],
+                        "Fallback row %d failed after re-auth: HTTP %d",
+                        row_id, resp2.status_code,
                     )
             except Exception as exc:
                 increment_retry(row_id)
-                log.warning(
-                    "Row %d re-authentication attempt raised: %s", row_id, exc
-                )
+                log.warning("Fallback row %d re-auth raised: %s", row_id, exc)
+
+        elif 400 <= resp.status_code < 500:
+            # This specific row is bad — charge only this row.
+            increment_retry(row_id)
+            log.warning(
+                "Fallback row %d rejected: HTTP %d — %s",
+                row_id, resp.status_code, resp.text[:100],
+            )
 
         else:
-            # Unexpected status (e.g. 422 Unprocessable, 500 server error).
-            increment_retry(row_id)
-            retry_count = get_retry_count(row_id)
-            if retry_count >= MAX_RETRIES:
-                log.error(
-                    "Row %d permanently failed after %d retries: "
-                    "HTTP %d — %s",
-                    row_id, MAX_RETRIES, resp.status_code, resp.text[:200],
+            # 5xx — server problem, stop the loop; remaining rows stay unsent
+            # and will be picked up in the next batch cycle.
+            log.warning(
+                "Fallback row %d: server error HTTP %d — stopping fallback, "
+                "remaining rows will retry next cycle",
+                row_id, resp.status_code,
+            )
+            return
+
+
+def forward_outbox(token_manager: TokenManager, api_base_url: str):
+    """Send pending outbox rows to POST /data/batch in chunks of BATCH_SIZE.
+
+    Each call drains at most BATCH_SIZE rows — the poll loop calls this once
+    per cycle, so the batch and poll loops cannot starve each other.
+
+    Behaviour per response code:
+    - 2xx         → mark_batch_sent() in one UPDATE, log backlog count
+    - 401         → on_401() + one retry; fall back to per-row on second failure
+    - other 4xx   → _fallback_send_one_by_one() to isolate the bad row;
+                    only that row gets its retry_count incremented
+    - 5xx         → leave all rows unsent (server problem, payload is fine)
+    - network err → leave all rows unsent, stop this cycle
+    """
+    url = api_base_url.rstrip("/") + "/data/batch"
+    rows = fetch_unsent(limit=BATCH_SIZE)
+
+    if not rows:
+        log.debug("Outbox is empty — nothing to forward")
+        return
+
+    row_ids = [r[0] for r in rows]
+
+    # Build the batch body.  Strip company_id — the API derives it from the JWT.
+    # value_text defaults to None for VFD numeric readings not present in payload.
+    readings = []
+    for _, payload_json in rows:
+        p = json.loads(payload_json)
+        readings.append({
+            "timestamp":             p["timestamp"],
+            "component_instance_id": p["component_instance_id"],
+            "tag_definition_id":     p["tag_definition_id"],
+            "value_num":             p.get("value_num"),
+            "value_text":            p.get("value_text"),
+        })
+
+    try:
+        token = token_manager.get_token()
+        resp = requests.post(
+            url,
+            json={"readings": readings},
+            headers={"Authorization": "Bearer " + token},
+            timeout=30,   # larger than single-row; 200 rows at ~340 ms RTT
+        )
+    except requests.exceptions.ConnectionError:
+        log.warning(
+            "Network unreachable — stopping forward cycle, will retry at next poll"
+        )
+        return
+    except requests.exceptions.Timeout:
+        log.warning(
+            "Batch request timed out (%d rows) — will retry at next poll", len(rows)
+        )
+        return
+
+    if resp.status_code in (200, 201, 202):
+        mark_batch_sent(row_ids)
+        remaining = count_unsent()
+        log.info("Flushed %d rows (backlog: %d remaining)", len(rows), remaining)
+
+    elif resp.status_code == 401:
+        token_manager.on_401()
+        try:
+            new_token = token_manager.get_token()
+            resp2 = requests.post(
+                url,
+                json={"readings": readings},
+                headers={"Authorization": "Bearer " + new_token},
+                timeout=30,
+            )
+            if resp2.status_code in (200, 201, 202):
+                mark_batch_sent(row_ids)
+                remaining = count_unsent()
+                log.info(
+                    "Flushed %d rows after re-auth (backlog: %d remaining)",
+                    len(rows), remaining,
                 )
             else:
+                # Re-auth succeeded but the batch was still rejected.
+                # Fall back to per-row to avoid blanket retry charges.
                 log.warning(
-                    "Row %d: HTTP %d — retry %d/%d",
-                    row_id, resp.status_code, retry_count, MAX_RETRIES,
+                    "Batch of %d rows failed after re-auth: HTTP %d — "
+                    "falling back to per-row send to isolate bad row",
+                    len(rows), resp2.status_code,
                 )
+                _fallback_send_one_by_one(row_ids, readings, token_manager, api_base_url)
+        except Exception as exc:
+            log.warning(
+                "Re-auth attempt raised: %s — batch of %d rows left unsent", exc, len(rows)
+            )
+
+    elif 400 <= resp.status_code < 500:
+        # One bad row in the batch caused a 4xx.  Blanket-incrementing retry_count
+        # on all 200 rows would silently expire the entire backlog after MAX_RETRIES
+        # cycles — the blast radius is 200× that of the old single-row forwarder.
+        # Fall back to per-row sends so only the offending row gets charged.
+        log.warning(
+            "Batch rejected (HTTP %d) — falling back to per-row send to isolate bad row. "
+            "%s",
+            resp.status_code, resp.text[:200],
+        )
+        _fallback_send_one_by_one(row_ids, readings, token_manager, api_base_url)
+
+    else:
+        # 5xx: server-side problem — the payload is fine, the server is not.
+        # Leave all rows unsent and do NOT increment retry_count.
+        log.warning(
+            "Batch of %d rows: server error HTTP %d — leaving unsent, "
+            "will retry at next poll",
+            len(rows), resp.status_code,
+        )
 
 
 # ---------------------------------------------------------------------------
