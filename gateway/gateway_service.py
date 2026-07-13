@@ -614,11 +614,13 @@ def _fallback_send_one_by_one(
             return
 
 
-def forward_outbox(token_manager: TokenManager, api_base_url: str):
-    """Send pending outbox rows to POST /data/batch in chunks of BATCH_SIZE.
+def _forward_one_batch(token_manager: TokenManager, api_base_url: str) -> bool:
+    """Send ONE batch of up to BATCH_SIZE rows to POST /data/batch.
 
-    Each call drains at most BATCH_SIZE rows — the poll loop calls this once
-    per cycle, so the batch and poll loops cannot starve each other.
+    Returns True only if a batch was successfully flushed — the caller uses
+    this to decide whether to keep draining. Any other outcome (empty outbox,
+    network error, 4xx, 5xx) returns None/False, which stops the drain loop
+    and defers to the next poll cycle.
 
     Behaviour per response code:
     - 2xx         → mark_batch_sent() in one UPDATE, log backlog count
@@ -673,6 +675,7 @@ def forward_outbox(token_manager: TokenManager, api_base_url: str):
         mark_batch_sent(row_ids)
         remaining = count_unsent()
         log.info("Flushed %d rows (backlog: %d remaining)", len(rows), remaining)
+        return True
 
     elif resp.status_code == 401:
         token_manager.on_401()
@@ -691,6 +694,7 @@ def forward_outbox(token_manager: TokenManager, api_base_url: str):
                     "Flushed %d rows after re-auth (backlog: %d remaining)",
                     len(rows), remaining,
                 )
+                return True
             else:
                 # Re-auth succeeded but the batch was still rejected.
                 # Fall back to per-row to avoid blanket retry charges.
@@ -725,6 +729,32 @@ def forward_outbox(token_manager: TokenManager, api_base_url: str):
             "will retry at next poll",
             len(rows), resp.status_code,
         )
+
+
+def forward_outbox(token_manager: TokenManager, api_base_url: str):
+    """Drain the outbox, up to MAX_BATCHES_PER_CYCLE batches per poll cycle.
+
+    Batching alone was not enough. _forward_one_batch() sends 200 rows in one
+    request, but the poll loop only calls the forwarder once per cycle, and a
+    cycle takes ~23 s (14 Modbus reads at 9600 baud, plus timeouts on any dead
+    slave). That capped the drain at 200 rows / 23 s ≈ 8.7 rows/sec against a
+    ~3.8 rows/sec production rate — barely positive, and hopeless against a
+    132k-row backlog.
+
+    Looping lifts the ceiling to 5,000 rows per cycle. Once the backlog is
+    cleared the loop exits on the first empty fetch, so steady-state cost is
+    one cheap SELECT per cycle.
+
+    The MAX_BATCHES_PER_CYCLE cap matters: without it, a first run against a
+    large backlog would block the poll loop for minutes and we would miss
+    Modbus reads. Bounded, the worst case is ~25 s of flushing while catching
+    up, and effectively zero once caught up.
+    """
+    MAX_BATCHES_PER_CYCLE = 25   # 25 × 200 = 5,000 rows/cycle ceiling
+
+    for _ in range(MAX_BATCHES_PER_CYCLE):
+        if not _forward_one_batch(token_manager, api_base_url):
+            return   # empty, or an error the batch function already logged
 
 
 # ---------------------------------------------------------------------------
