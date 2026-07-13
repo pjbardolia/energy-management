@@ -17,6 +17,7 @@ const C = {
   muted:    "#888888",
   running:  "#16A34A",
   stopped:  "#9CA3AF",
+  amber:    "#D97706",   // stale tile footer and fleet banner
 };
 const POLL_MS  = 10_000;
 // In dev the Vite proxy forwards /api → http://165.22.247.235:8001 (strips /api prefix).
@@ -77,6 +78,31 @@ const nowIST = () =>
     timeZone:"Asia/Kolkata", day:"2-digit", month:"short",
     hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:true,
   });
+
+const STALE_THRESHOLD_MS = 2 * 60 * 1000;  // 2 min = 12 missed 10 s poll cycles
+
+// A reading is stale if last_updated is older than STALE_THRESHOLD_MS.
+// Normalise to UTC before comparison — API timestamps have no Z suffix
+// (same pattern as toIST above; without it new Date() parses as local time
+// and isStale always returns false for IST users).
+function isStale(lastUpdated) {
+  if (!lastUpdated) return true;
+  const ts = lastUpdated.endsWith("Z") ? lastUpdated : lastUpdated + "Z";
+  return (Date.now() - new Date(ts).getTime()) > STALE_THRESHOLD_MS;
+}
+
+// Human-readable relative time: "42s ago", "5m ago", "1h 12m ago", "Never".
+function lastSeenText(lastUpdated) {
+  if (!lastUpdated) return "Never";
+  const ts      = lastUpdated.endsWith("Z") ? lastUpdated : lastUpdated + "Z";
+  const diffMs  = Date.now() - new Date(ts).getTime();
+  const diffSec = Math.floor(diffMs / 1000);
+  const diffMin = Math.floor(diffSec / 60);
+  const diffHr  = Math.floor(diffMin / 60);
+  if (diffSec < 60)  return diffSec + "s ago";
+  if (diffMin < 60)  return diffMin + "m ago";
+  return diffHr + "h " + (diffMin % 60) + "m ago";
+}
 
 /* ═══════════════════════════════════════════════════════════════
    OFFLINE DEVELOPMENT ONLY
@@ -176,14 +202,14 @@ const flattenHistory = (buckets) =>
 /* ═══════════════════════════════════════════════════════════════
    STATUS DOT — pulse animation for running machines
 ═══════════════════════════════════════════════════════════════ */
-const Dot = ({on}) => (
+const Dot = ({on, stale}) => (
   <span style={{position:"relative",display:"inline-flex",width:10,height:10,flexShrink:0}}>
     <span style={{
       position:"absolute",inset:0,borderRadius:"50%",
-      background: on ? C.running : C.stopped,
-      animation: on ? "dotPulse 2.5s ease-in-out infinite" : "none",
+      background: (!stale && on) ? C.running : C.stopped,
+      animation: (!stale && on) ? "dotPulse 2.5s ease-in-out infinite" : "none",
     }}/>
-    {on && (
+    {(!stale && on) && (
       <span style={{
         position:"absolute",inset:-3,borderRadius:"50%",
         background:C.running, opacity:0,
@@ -305,7 +331,10 @@ const LoginPage = ({onLogin}) => {
    MACHINE TILE
 ═══════════════════════════════════════════════════════════════ */
 const Tile = ({machine, onClick}) => {
-  const on = (machine.tags?.frequency ?? 0) > 0;
+  // Priority: stale > running > stopped > no-data.
+  // Stale overrides running/stopped because we don't know the current state.
+  const stale = isStale(machine.last_updated);
+  const on    = !stale && (machine.tags?.frequency ?? 0) > 0;
   const [hov, setHov] = useState(false);
 
   return (
@@ -315,8 +344,8 @@ const Tile = ({machine, onClick}) => {
       onMouseLeave={()=>setHov(false)}
       style={{
         background:C.white, borderRadius:12,
-        border:`1.5px solid ${hov ? (on?"rgba(22,163,74,.35)":C.border) : C.border}`,
-        borderLeft:`4px solid ${on ? C.running : C.stopped}`,
+        border:`1.5px solid ${hov ? (!stale && on ? "rgba(22,163,74,.35)" : C.border) : C.border}`,
+        borderLeft:`4px solid ${(!stale && on) ? C.running : C.stopped}`,
         padding:"18px 16px 13px",
         cursor:"pointer",
         transition:"all .14s ease",
@@ -331,14 +360,17 @@ const Tile = ({machine, onClick}) => {
           <div style={{fontSize:10,color:C.muted,marginTop:2}}>{machine.model}</div>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:5,paddingTop:1}}>
-          <Dot on={on}/>
-          <span style={{fontSize:10,fontWeight:700,color:on?C.running:C.stopped,letterSpacing:.5}}>
-            {on?"RUNNING":"STOPPED"}
+          <Dot on={on} stale={stale}/>
+          <span style={{fontSize:10,fontWeight:700,letterSpacing:.5,
+            color: stale ? C.muted : (on ? C.running : C.stopped)}}>
+            {stale ? "STALE" : (on ? "RUNNING" : "STOPPED")}
           </span>
         </div>
       </div>
 
-      {/* Metrics 2×2 — fmt() returns "—" for missing tags, number string for 0 and above */}
+      {/* Metrics 2×2
+          Stale: show last known value in muted — not dashes.
+          The operator needs to know what the machine was doing when contact was lost. */}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px 14px",marginBottom:11}}>
         {[
           {label:"Frequency", val:fmt(machine.tags?.frequency),  unit:"Hz", big:true,  accent:true  },
@@ -351,13 +383,13 @@ const Tile = ({machine, onClick}) => {
             <div style={{
               fontSize: m.big ? 20 : 14,
               fontWeight: m.big ? 800 : 700,
-              color: on ? (m.accent ? C.red : C.text) : C.stopped,
+              color: stale ? C.muted : (on ? (m.accent ? C.red : C.text) : C.stopped),
               fontVariantNumeric:"tabular-nums",
               letterSpacing: m.big ? -.3 : -.1,
               lineHeight:1.1,
             }}>
-              {on ? m.val : "—"}
-              {on && m.val !== "—" && m.unit && (
+              {stale ? m.val : (on ? m.val : "—")}
+              {(on || stale) && m.val !== "—" && m.unit && (
                 <span style={{fontSize:10,fontWeight:400,color:C.muted,marginLeft:2}}>{m.unit}</span>
               )}
             </div>
@@ -365,12 +397,14 @@ const Tile = ({machine, onClick}) => {
         ))}
       </div>
 
-      {/* Footer */}
+      {/* Footer — amber relative time when stale; IST clock time when fresh */}
       <div style={{
         borderTop:`1px solid ${C.border}`,paddingTop:9,
-        fontSize:10,color:C.muted,
+        fontSize:10, color: stale ? C.amber : C.muted,
       }}>
-        Updated {toIST(machine.last_updated)} IST
+        {stale
+          ? "Last seen " + lastSeenText(machine.last_updated)
+          : "Updated " + toIST(machine.last_updated) + " IST"}
       </div>
     </div>
   );
@@ -485,6 +519,35 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
             </div>
           ))}
         </div>
+
+        {/* Staleness banner — shown when any machine has stale data.
+            Not dismissible: disappears automatically when fresh data arrives.
+            Amber = warning, not fault (the API itself is working fine). */}
+        {fleet.some(m => isStale(m.last_updated)) && (() => {
+          const validTs = fleet
+            .filter(m => m.last_updated)
+            .map(m => new Date(
+              m.last_updated.endsWith("Z") ? m.last_updated : m.last_updated + "Z"
+            ).getTime());
+          const oldestMs = validTs.length ? Math.min(...validTs) : null;
+          const agoText  = oldestMs
+            ? lastSeenText(new Date(oldestMs).toISOString())
+            : "unknown";
+          return (
+            <div style={{
+              background:"#FFFBEB", border:"1px solid #FDE68A", borderRadius:8,
+              padding:"10px 16px", marginBottom:14,
+              color:"#92400E", fontSize:13, lineHeight:1.6,
+            }}>
+              <div style={{fontWeight:700,marginBottom:2}}>
+                ⚠ Gateway data is stale — last reading received {agoText}.
+              </div>
+              <div style={{fontSize:12,opacity:.85}}>
+                The gateway may be offline or the factory internet connection may be down.
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Error banner — shown when a poll fails; keeps last known grid visible */}
         {error && (
