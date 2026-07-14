@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -32,6 +33,7 @@ from routers.tag_definition_router import router as tag_definition_router
 from routers.data_router import router as data_router
 from routers.telemetry_read import router as telemetry_read_router
 from routers.gateway_heartbeat import router as gateway_heartbeat_router
+from services.alert_scheduler import start_alert_scheduler
 
 from passlib.context import CryptContext
 
@@ -50,13 +52,23 @@ import os
 if os.getenv("DEVELOPMENT_MODE", "").lower() == "true":
     Base.metadata.create_all(bind=engine)
 
+@asynccontextmanager
+async def lifespan(app):
+    # Startup: launch the background alert scheduler (gateway offline + overcurrent)
+    scheduler = start_alert_scheduler()
+    yield
+    # Shutdown: stop gracefully so APScheduler threads don't outlive the process
+    scheduler.shutdown(wait=False)
+
+
 app = FastAPI(
     title="Energy Management API",
     description=(
         "Generic multi-tenant Industrial IoT SaaS platform. "
         "Phase 4d: JWT hardening, app-layer tenant filtering, RLS foundation."
     ),
-    version="0.4.4"
+    version="0.4.4",
+    lifespan=lifespan,
 )
 
 # Register all routers — order determines Swagger display order

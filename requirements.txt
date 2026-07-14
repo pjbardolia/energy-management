@@ -3,6 +3,7 @@
 # internal API and will cause a runtime error at startup.
 
 alembic==1.18.5
+apscheduler==3.10.4
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.14.1
