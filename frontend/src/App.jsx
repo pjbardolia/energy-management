@@ -456,9 +456,23 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
   const [summary, setSummary] = useState({
     total_machines: 0, running: 0, stopped: 0, total_power_kw: 0, last_updated: null,
   });
-  const [time, setTime]       = useState(nowIST());
-  const [loading, setLoading] = useState(true);
-  const [error, setError]     = useState(null);
+  const [time, setTime]             = useState(nowIST());
+  const [loading, setLoading]       = useState(true);
+  const [error, setError]           = useState(null);
+  const [gatewayStatus, setGatewayStatus] = useState(null);
+
+  // Poll gateway status every 30 s — independent of 10 s machine polling.
+  // On failure, setGatewayStatus(null) so the badge simply disappears.
+  useEffect(() => {
+    const fetchGatewayStatus = () => {
+      apiFetch('/gateway/status', token)
+        .then(data => setGatewayStatus(data))
+        .catch(() => setGatewayStatus(null));
+    };
+    fetchGatewayStatus();
+    const iv = setInterval(fetchGatewayStatus, 30_000);
+    return () => clearInterval(iv);
+  }, [token]);
 
   const refresh = useCallback(async () => {
     try {
@@ -527,6 +541,33 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
           <span style={{fontSize:13,color:C.muted,fontWeight:500}}>Factory Monitor</span>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:14}}>
+          {/* Gateway status badge — shown once the first /gateway/status fetch returns.
+              Hidden on null (failed fetch or first load) so the header stays clean. */}
+          {gatewayStatus !== null && (
+            <div style={{display:"flex",alignItems:"center",gap:6,fontSize:13}}>
+              {/* Coloured dot: green = online, amber = offline */}
+              <span style={{
+                width:8, height:8, borderRadius:"50%", display:"inline-block", flexShrink:0,
+                background: gatewayStatus.is_online ? "#22c55e" : "#f59e0b",
+              }}/>
+              {/* Text: dark colours — the header background is white */}
+              <span style={{color: gatewayStatus.is_online ? C.running : C.amber}}>
+                {gatewayStatus.is_online
+                  ? `Gateway · ${gatewayStatus.seconds_ago}s ago`
+                  : `Gateway offline · ${lastSeenText(gatewayStatus.last_seen)}`
+                }
+              </span>
+              {/* Modbus-error chip: only when online but some slaves failed */}
+              {gatewayStatus.is_online && gatewayStatus.machines_failed > 0 && (
+                <span style={{
+                  background:"#7c2d12", color:"#fca5a5",
+                  borderRadius:4, padding:"1px 5px", fontSize:11,
+                }}>
+                  {gatewayStatus.machines_failed} Modbus error{gatewayStatus.machines_failed > 1 ? "s" : ""}
+                </span>
+              )}
+            </div>
+          )}
           <span style={{fontSize:12,color:C.muted}}>{time} IST</span>
           <button className="so" onClick={onLogout} style={{
             padding:"6px 14px", border:`1.5px solid ${C.border}`,

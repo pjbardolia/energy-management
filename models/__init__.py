@@ -24,3 +24,5 @@ from .tag_definition import TagDefinition
 from .component_type_tag import ComponentTypeTag
 
 from .telemetry_data import TelemetryData
+
+from .gateway_heartbeat import GatewayHeartbeat

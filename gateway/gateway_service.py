@@ -757,6 +757,48 @@ def forward_outbox(token_manager: TokenManager, api_base_url: str):
             return   # empty, or an error the batch function already logged
 
 
+def post_heartbeat(
+    token_manager:    TokenManager,
+    api_base_url:     str,
+    poll_duration_sec: float,
+    machines_polled:  int,
+    machines_failed:  int,
+) -> None:
+    """
+    POST /gateway/heartbeat after every poll cycle.
+    Tells the server the Pi is alive and reports basic poll health.
+    Failures are logged as warnings but never raise — a heartbeat failure
+    must never interrupt the poll loop.
+    """
+    try:
+        token = token_manager.get_token()
+        resp  = requests.post(
+            api_base_url.rstrip("/") + "/gateway/heartbeat",
+            json = {
+                "poll_duration_sec": round(poll_duration_sec, 2),
+                "machines_polled":   machines_polled,
+                "machines_failed":   machines_failed,
+            },
+            headers = {"Authorization": "Bearer " + token},
+            timeout = 5,  # must never slow down the poll cycle
+        )
+        if resp.status_code == 204:
+            log.debug(
+                "Heartbeat posted (%.1fs poll, %d/%d machines ok)",
+                poll_duration_sec,
+                machines_polled - machines_failed,
+                machines_polled,
+            )
+        elif resp.status_code == 401:
+            token_manager.on_401()
+            log.warning("Heartbeat 401 — token invalidated, will retry next cycle")
+        else:
+            log.warning("Heartbeat unexpected status %d", resp.status_code)
+    except Exception as exc:
+        # Fire-and-forget: any exception is logged but never propagated.
+        log.warning("Heartbeat post failed: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # COMPONENT 5a — Modbus reader (single device)
 # ---------------------------------------------------------------------------
@@ -935,8 +977,10 @@ def run(config: dict):
 
     while True:
         try:
+            poll_cycle_start = time.time()
             timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
-            total_written = 0   # outbox writes this cycle across all devices
+            total_written  = 0   # outbox writes this cycle across all devices
+            machines_failed = 0  # devices that returned None from read_modbus
 
             # ── Step 1: Poll each device ─────────────────────────────────
             for device in devices:
@@ -956,6 +1000,7 @@ def run(config: dict):
                     # Modbus failure is already logged inside read_modbus().
                     # We do NOT count this as a consecutive failure — it is a
                     # handled condition, not an unhandled exception.
+                    machines_failed += 1
                     log.warning("[%s] Skipping — no data this cycle", dev_label)
                     continue
 
@@ -1000,6 +1045,18 @@ def run(config: dict):
                 total_written, len(devices),
             )
             forward_outbox(token_manager, api_base_url)
+
+            # ── Step 4: Post heartbeat ────────────────────────────────────
+            # Call AFTER forward_outbox — outbox flushing is more important.
+            # post_heartbeat() is fire-and-forget; failures are logged, not raised.
+            poll_duration = time.time() - poll_cycle_start
+            post_heartbeat(
+                token_manager     = token_manager,
+                api_base_url      = api_base_url,
+                poll_duration_sec = poll_duration,
+                machines_polled   = len(devices),
+                machines_failed   = machines_failed,
+            )
 
             # Reaching here means no unhandled exception occurred this cycle.
             _consecutive_failures = 0
