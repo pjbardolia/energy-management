@@ -38,6 +38,8 @@ services:
       # as a safety net during local development.  Remove or set to false in production
       # — Alembic is the only schema manager there.
       DEVELOPMENT_MODE: "true"
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
     ports:
       - "8001:8000"             # matches your server, so it's localhost:8001/docs
     volumes:
