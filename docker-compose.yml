@@ -30,7 +30,7 @@ services:
 
   api:
     build: .
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       SECRET_KEY: ${SECRET_KEY}
@@ -41,7 +41,7 @@ services:
     ports:
       - "8001:8000"             # matches your server, so it's localhost:8001/docs
     volumes:
-      - .:/app                  # your code edits reload live, no rebuild
+      - .:/app:ro               # read-only; no --reload in production
     depends_on:
       postgres:
         condition: service_healthy
