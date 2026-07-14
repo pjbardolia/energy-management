@@ -608,7 +608,7 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
             .map(m => new Date(
               m.last_updated.endsWith("Z") ? m.last_updated : m.last_updated + "Z"
             ).getTime());
-          const oldestMs = validTs.length ? Math.min(...validTs) : null;
+          const oldestMs = validTs.length ? Math.max(...validTs) : null;
           const agoText  = oldestMs
             ? lastSeenText(new Date(oldestMs).toISOString())
             : "unknown";
