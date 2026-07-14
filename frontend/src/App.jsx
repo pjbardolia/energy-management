@@ -104,6 +104,18 @@ function lastSeenText(lastUpdated) {
   return diffHr + "h " + (diffMin % 60) + "m ago";
 }
 
+// Four machine states, priority: STALE > RUNNING > STOPPED > NO_DATA.
+// STOPPED VFDs still report real Modbus values (0 Hz, 0 A, ~565 V DC bus)
+// so STOPPED must show real fmt() values, not "—".
+function getMachineState(machine) {
+  if (!machine.last_updated) return 'NO_DATA';
+  if (isStale(machine.last_updated)) return 'STALE';
+  const freq = machine.tags?.frequency ?? null;
+  if (freq === null) return 'NO_DATA';
+  if (freq > 0) return 'RUNNING';
+  return 'STOPPED';
+}
+
 /* ═══════════════════════════════════════════════════════════════
    OFFLINE DEVELOPMENT ONLY
    buildFleet() and buildHistory() generate synthetic data for UI
@@ -331,11 +343,31 @@ const LoginPage = ({onLogin}) => {
    MACHINE TILE
 ═══════════════════════════════════════════════════════════════ */
 const Tile = ({machine, onClick}) => {
-  // Priority: stale > running > stopped > no-data.
-  // Stale overrides running/stopped because we don't know the current state.
-  const stale = isStale(machine.last_updated);
-  const on    = !stale && (machine.tags?.frequency ?? 0) > 0;
+  // getMachineState() encodes four states: STALE > RUNNING > STOPPED > NO_DATA.
+  // STOPPED VFDs report real 0 Hz / 0 A / ~565 V — show those values, not dashes.
+  const state = getMachineState(machine);
   const [hov, setHov] = useState(false);
+
+  const isRunning    = state === 'RUNNING';
+  const isStaleState = state === 'STALE';
+
+  // RUNNING and STOPPED get coloured pill chips; STALE/NO_DATA are plain text.
+  const badge = (() => {
+    if (state === 'RUNNING') return (
+      <span style={{fontSize:10,fontWeight:700,letterSpacing:.5,
+        background:"#22c55e",color:"#fff",padding:"1px 6px",borderRadius:4}}>RUNNING</span>
+    );
+    if (state === 'STOPPED') return (
+      <span style={{fontSize:10,fontWeight:700,letterSpacing:.5,
+        background:"#6b7280",color:"#fff",padding:"1px 6px",borderRadius:4}}>STOPPED</span>
+    );
+    if (state === 'STALE') return (
+      <span style={{fontSize:10,fontWeight:700,letterSpacing:.5,color:"#9ca3af"}}>STALE</span>
+    );
+    return (
+      <span style={{fontSize:10,fontWeight:700,letterSpacing:.5,color:"#374151"}}>NO DATA</span>
+    );
+  })();
 
   return (
     <div
@@ -344,8 +376,8 @@ const Tile = ({machine, onClick}) => {
       onMouseLeave={()=>setHov(false)}
       style={{
         background:C.white, borderRadius:12,
-        border:`1.5px solid ${hov ? (!stale && on ? "rgba(22,163,74,.35)" : C.border) : C.border}`,
-        borderLeft:`4px solid ${(!stale && on) ? C.running : C.stopped}`,
+        border:`1.5px solid ${hov ? (isRunning ? "rgba(22,163,74,.35)" : C.border) : C.border}`,
+        borderLeft:`4px solid ${isRunning ? C.running : C.stopped}`,
         padding:"18px 16px 13px",
         cursor:"pointer",
         transition:"all .14s ease",
@@ -360,49 +392,55 @@ const Tile = ({machine, onClick}) => {
           <div style={{fontSize:10,color:C.muted,marginTop:2}}>{machine.model}</div>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:5,paddingTop:1}}>
-          <Dot on={on} stale={stale}/>
-          <span style={{fontSize:10,fontWeight:700,letterSpacing:.5,
-            color: stale ? C.muted : (on ? C.running : C.stopped)}}>
-            {stale ? "STALE" : (on ? "RUNNING" : "STOPPED")}
-          </span>
+          <Dot on={isRunning} stale={isStaleState}/>
+          {badge}
         </div>
       </div>
 
       {/* Metrics 2×2
-          Stale: show last known value in muted — not dashes.
-          The operator needs to know what the machine was doing when contact was lost. */}
+          RUNNING: accent red / C.text values.
+          STOPPED: grey values — real zeros, not dashes (VFD is powered, motor idle).
+          STALE:   muted last-known values — not dashes (operator needs last reading).
+          NO_DATA: dashes. */}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px 14px",marginBottom:11}}>
         {[
           {label:"Frequency", val:fmt(machine.tags?.frequency),  unit:"Hz", big:true,  accent:true  },
           {label:"Power",     val:fmt(machine.tags?.power),      unit:"kW", big:true,  accent:true  },
           {label:"Current",   val:fmt(machine.tags?.current),    unit:"A",  big:false, accent:false },
           {label:"RPM",       val:fmt(machine.tags?.rpm, 0),     unit:"",   big:false, accent:false },
-        ].map(m=>(
-          <div key={m.label}>
-            <div style={{fontSize:10,color:C.muted,fontWeight:500,marginBottom:1}}>{m.label}</div>
-            <div style={{
-              fontSize: m.big ? 20 : 14,
-              fontWeight: m.big ? 800 : 700,
-              color: stale ? C.muted : (on ? (m.accent ? C.red : C.text) : C.stopped),
-              fontVariantNumeric:"tabular-nums",
-              letterSpacing: m.big ? -.3 : -.1,
-              lineHeight:1.1,
-            }}>
-              {stale ? m.val : (on ? m.val : "—")}
-              {(on || stale) && m.val !== "—" && m.unit && (
-                <span style={{fontSize:10,fontWeight:400,color:C.muted,marginLeft:2}}>{m.unit}</span>
-              )}
+        ].map(m=>{
+          const valueColor =
+            state === 'RUNNING' ? (m.accent ? C.red : C.text) :
+            state === 'STOPPED' ? '#9ca3af' :
+            C.muted;
+          const displayVal = state === 'NO_DATA' ? '—' : m.val;
+          return (
+            <div key={m.label}>
+              <div style={{fontSize:10,color:C.muted,fontWeight:500,marginBottom:1}}>{m.label}</div>
+              <div style={{
+                fontSize: m.big ? 20 : 14,
+                fontWeight: m.big ? 800 : 700,
+                color: valueColor,
+                fontVariantNumeric:"tabular-nums",
+                letterSpacing: m.big ? -.3 : -.1,
+                lineHeight:1.1,
+              }}>
+                {displayVal}
+                {displayVal !== "—" && m.unit && (
+                  <span style={{fontSize:10,fontWeight:400,color:C.muted,marginLeft:2}}>{m.unit}</span>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* Footer — amber relative time when stale; IST clock time when fresh */}
       <div style={{
         borderTop:`1px solid ${C.border}`,paddingTop:9,
-        fontSize:10, color: stale ? C.amber : C.muted,
+        fontSize:10, color: isStaleState ? C.amber : C.muted,
       }}>
-        {stale
+        {isStaleState
           ? "Last seen " + lastSeenText(machine.last_updated)
           : "Updated " + toIST(machine.last_updated) + " IST"}
       </div>
@@ -600,12 +638,15 @@ const METRICS_DEF = [
   {key:"torque",         label:"Torque",           unit:"%",  color:"#DB2777", dec:1 },
 ];
 
+const TIME_WINDOWS = [1, 3, 6, 12, 24];  // hours; drives the history fetch and chart title
+
 const JetDetail = ({machine, token, onBack, onLogout}) => {
-  const [live, setLive]       = useState(machine);
-  const [hist, setHist]       = useState([]);
-  const [active, setActive]   = useState("frequency");
-  const [time, setTime]       = useState(nowIST());
-  const [error, setError]     = useState(null);
+  const [live, setLive]               = useState(machine);
+  const [hist, setHist]               = useState([]);
+  const [active, setActive]           = useState("frequency");
+  const [historyHours, setHistoryHours] = useState(1);
+  const [time, setTime]               = useState(nowIST());
+  const [error, setError]             = useState(null);
 
   const on  = (live.tags?.frequency ?? 0) > 0;
   const met = METRICS_DEF.find(m=>m.key===active) || METRICS_DEF[0];
@@ -617,7 +658,7 @@ const JetDetail = ({machine, token, onBack, onLogout}) => {
       try {
         const [liveData, histData] = await Promise.all([
           apiFetch(`/machines/${machine.machine_id}/live`, token),
-          apiFetch(`/machines/${machine.machine_id}/history?hours=1`, token),
+          apiFetch(`/machines/${machine.machine_id}/history?hours=${historyHours}`, token),
         ]);
         if (cancelled) return;
         // Recover model/slave_id from master list — not present in the live API response.
@@ -636,7 +677,7 @@ const JetDetail = ({machine, token, onBack, onLogout}) => {
     fetchAll();
     const iv = setInterval(fetchAll, POLL_MS);
     return () => { cancelled = true; clearInterval(iv); };
-  }, [machine.machine_id, token, onLogout]);
+  }, [machine.machine_id, token, onLogout, historyHours]);
 
   // fmt here is scoped to JetDetail to handle the "alive" check:
   // dc_voltage is shown even when frequency=0 (machine stopped but powered).
@@ -749,10 +790,10 @@ const JetDetail = ({machine, token, onBack, onLogout}) => {
 
         {/* Chart panel */}
         <div style={{background:C.white,borderRadius:12,padding:"22px 24px",border:`1.5px solid ${C.border}`}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:16}}>
             <div>
               <div style={{fontSize:14,fontWeight:700,color:C.text}}>
-                {met.label} — last 60 minutes
+                {met.label} — last {historyHours === 1 ? "60 minutes" : `${historyHours} hours`}
               </div>
               <div style={{fontSize:11,color:C.muted,marginTop:3}}>
                 Select a metric above to switch view · auto-refreshes every 10 s
@@ -765,6 +806,24 @@ const JetDetail = ({machine, token, onBack, onLogout}) => {
               {fmt(met, live.tags?.[met.key])}
               <span style={{fontSize:13,fontWeight:400,color:C.muted,marginLeft:4}}>{met.unit}</span>
             </div>
+          </div>
+
+          {/* Time window selector — changes history fetch depth and chart title */}
+          <div style={{display:"flex",gap:6,marginBottom:16}}>
+            {TIME_WINDOWS.map(h => (
+              <button
+                key={h}
+                onClick={()=>setHistoryHours(h)}
+                style={{
+                  padding:"4px 12px", borderRadius:6, fontFamily:"inherit",
+                  border: historyHours===h ? "none" : "1px solid #374151",
+                  background: historyHours===h ? C.red : "transparent",
+                  color: historyHours===h ? "#fff" : "#9ca3af",
+                  fontWeight: historyHours===h ? 700 : 400,
+                  fontSize:12, cursor:"pointer",
+                }}
+              >{h}h</button>
+            ))}
           </div>
 
           {/* flattenHistory maps { bucket, tags:{...} } → { label, frequency, power, ... }
