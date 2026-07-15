@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import {
   AreaChart, Area, XAxis, YAxis,
   CartesianGrid, Tooltip, ResponsiveContainer,
+  BarChart, Bar, Legend,
 } from "recharts";
 
 /* ═══════════════════════════════════════════════════════════════
@@ -102,6 +103,12 @@ function lastSeenText(lastUpdated) {
   if (diffSec < 60)  return diffSec + "s ago";
   if (diffMin < 60)  return diffMin + "m ago";
   return diffHr + "h " + (diffMin % 60) + "m ago";
+}
+
+// Look up shift runtime for one machine in the shiftRuntime array from
+// /runtime/fleet/current-shift — returns null when the machine is not found.
+function getMachineRuntime(machineId, shiftRuntime) {
+  return shiftRuntime.find(r => r.machine_id === machineId) || null;
 }
 
 // Four machine states, priority: STALE > RUNNING > STOPPED > NO_DATA.
@@ -210,6 +217,33 @@ const apiFetch = async (path, token) => {
 // so Recharts dataKey={active} continues to work unchanged after the history shape change.
 const flattenHistory = (buckets) =>
   (buckets || []).map(d => ({ label: toIST(d.bucket), ...(d.tags || {}) }));
+
+/* ═══════════════════════════════════════════════════════════════
+   RUNTIME BAR — shift progress strip shown at the bottom of each tile
+═══════════════════════════════════════════════════════════════ */
+// runtime is a ShiftRuntimeResponse row from /runtime/fleet/current-shift.
+// Hidden until at least 5 minutes of data exist (avoids a misleading 0% bar
+// at the very start of a shift).
+function RuntimeBar({ runtime }) {
+  if (!runtime || runtime.sampled_minutes < 5) return null;
+  const pct     = Math.min(runtime.runtime_pct, 100);
+  const hours   = Math.floor(runtime.runtime_minutes / 60);
+  const minutes = Math.round(runtime.runtime_minutes % 60);
+  const label   = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+  const shift   = runtime.shift === 'day' ? 'Day shift' : 'Night shift';
+  return (
+    <div style={{ marginTop: 8, marginBottom: 2 }}>
+      {/* Track (dark) with red fill proportional to runtime percentage */}
+      <div style={{ height: 4, background: '#374151', borderRadius: 2, overflow: 'hidden', marginBottom: 4 }}>
+        <div style={{ height: '100%', width: `${pct}%`, background: C.red, borderRadius: 2, transition: 'width 0.5s ease' }} />
+      </div>
+      <div style={{ fontSize: 11, color: C.muted, display: 'flex', justifyContent: 'space-between' }}>
+        <span>{shift}: {label} running</span>
+        <span>{pct.toFixed(0)}%</span>
+      </div>
+    </div>
+  );
+}
 
 /* ═══════════════════════════════════════════════════════════════
    STATUS DOT — pulse animation for running machines
@@ -342,7 +376,7 @@ const LoginPage = ({onLogin}) => {
 /* ═══════════════════════════════════════════════════════════════
    MACHINE TILE
 ═══════════════════════════════════════════════════════════════ */
-const Tile = ({machine, onClick}) => {
+const Tile = ({machine, onClick, runtime}) => {
   // getMachineState() encodes four states: STALE > RUNNING > STOPPED > NO_DATA.
   // STOPPED VFDs report real 0 Hz / 0 A / ~565 V — show those values, not dashes.
   const state = getMachineState(machine);
@@ -435,6 +469,9 @@ const Tile = ({machine, onClick}) => {
         })}
       </div>
 
+      {/* Shift runtime bar — hidden until 5+ minutes of shift data */}
+      <RuntimeBar runtime={runtime} />
+
       {/* Footer — amber relative time when stale; IST clock time when fresh */}
       <div style={{
         borderTop:`1px solid ${C.border}`,paddingTop:9,
@@ -460,6 +497,9 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState(null);
   const [gatewayStatus, setGatewayStatus] = useState(null);
+  const [shiftRuntime, setShiftRuntime]   = useState([]);
+  // 'fleet' shows the machine grid; 'analytics' shows the AnalyticsPage panel.
+  const [activePage, setActivePage] = useState('fleet');
 
   // Poll gateway status every 30 s — independent of 10 s machine polling.
   // On failure, setGatewayStatus(null) so the badge simply disappears.
@@ -472,6 +512,20 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
     fetchGatewayStatus();
     const iv = setInterval(fetchGatewayStatus, 30_000);
     return () => clearInterval(iv);
+  }, [token]);
+
+  // Poll shift runtime every 60 s — feeds RuntimeBar on each machine tile.
+  // Failures are silently swallowed so the main grid is never affected.
+  useEffect(() => {
+    if (!token) return;
+    const fetchRuntime = () => {
+      apiFetch('/runtime/fleet/current-shift', token)
+        .then(data => setShiftRuntime(Array.isArray(data) ? data : []))
+        .catch(() => {});
+    };
+    fetchRuntime();
+    const id = setInterval(fetchRuntime, 60_000);
+    return () => clearInterval(id);
   }, [token]);
 
   const refresh = useCallback(async () => {
@@ -538,7 +592,18 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
             <img src="/mevion-logo.png" style={{height:48, width:"auto"}} alt="mevion"/>
           </div>
           <span style={{width:1,height:18,background:C.border}}/>
-          <span style={{fontSize:13,color:C.muted,fontWeight:500}}>Factory Monitor</span>
+          {/* Fleet / Analytics tab pills */}
+          <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+            {[['fleet', 'Fleet'], ['analytics', 'Analytics']].map(([p, label]) => (
+              <button key={p} onClick={() => setActivePage(p)} style={{
+                background: activePage === p ? C.red : 'transparent',
+                color: activePage === p ? '#fff' : C.muted,
+                border: 'none', borderRadius: 6, padding: '4px 12px',
+                fontSize: 13, fontWeight: activePage === p ? 600 : 400,
+                cursor: 'pointer', fontFamily: 'inherit',
+              }}>{label}</button>
+            ))}
+          </div>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:14}}>
           {/* Gateway status badge — shown once the first /gateway/status fetch returns.
@@ -632,25 +697,38 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
           </div>
         )}
 
-        {/* Section label */}
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:13}}>
-          <h2 style={{fontSize:13,fontWeight:700,color:C.text,margin:0,textTransform:"uppercase",letterSpacing:.5}}>
-            Jet dyeing machines
-          </h2>
-          <span style={{fontSize:11,color:C.muted}}>Auto-refreshes every 10 s</span>
-        </div>
+        {/* Section label + grid — only shown on the fleet tab */}
+        {activePage === 'fleet' && (
+          <>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:13}}>
+              <h2 style={{fontSize:13,fontWeight:700,color:C.text,margin:0,textTransform:"uppercase",letterSpacing:.5}}>
+                Jet dyeing machines
+              </h2>
+              <span style={{fontSize:11,color:C.muted}}>Auto-refreshes every 10 s</span>
+            </div>
 
-        {/* Grid */}
-        {loading ? (
-          <div style={{textAlign:"center",padding:60,color:C.muted}}>Loading fleet data…</div>
-        ) : fleet.length === 0 && error ? (
-          <div style={{textAlign:"center",padding:60,color:C.red}}>{error}</div>
-        ) : (
-          <div className="fg" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14}}>
-            {fleet.map(m=>(
-              <Tile key={m.machine_id} machine={m} onClick={()=>onSelect(m)}/>
-            ))}
-          </div>
+            {loading ? (
+              <div style={{textAlign:"center",padding:60,color:C.muted}}>Loading fleet data…</div>
+            ) : fleet.length === 0 && error ? (
+              <div style={{textAlign:"center",padding:60,color:C.red}}>{error}</div>
+            ) : (
+              <div className="fg" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14}}>
+                {fleet.map(m=>(
+                  <Tile
+                    key={m.machine_id}
+                    machine={m}
+                    onClick={()=>onSelect(m)}
+                    runtime={getMachineRuntime(m.machine_id, shiftRuntime)}
+                  />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Analytics tab */}
+        {activePage === 'analytics' && (
+          <AnalyticsPage token={token} onLogout={onLogout} />
         )}
       </main>
     </div>
@@ -886,6 +964,307 @@ const JetDetail = ({machine, token, onBack, onLogout}) => {
           </ResponsiveContainer>
         </div>
       </main>
+    </div>
+  );
+};
+
+/* ═══════════════════════════════════════════════════════════════
+   ANALYTICS PAGE
+   Dark-themed panel embedded in FleetDashboard's <main> area.
+   Fleet view: stacked BarChart of top-8 machines by total runtime.
+   Machine view: daily bar chart for one machine (0–24h y-axis).
+═══════════════════════════════════════════════════════════════ */
+const BAR_COLORS = [
+  "#E31837","#2563EB","#D97706","#7C3AED","#059669","#DB2777","#0891B2","#16A34A",
+  "#9333EA","#C2410C","#065F46","#1D4ED8","#92400E","#374151",
+];
+
+// Format minutes as "Xh Ym". Used in summary tables and cards.
+function fmtMinutes(min) {
+  if (!min || min < 1) return '0m';
+  const h = Math.floor(min / 60);
+  const m = Math.round(min % 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+// Return the top-n machine names sorted by total runtime (descending).
+function getTopMachineKeys(summaries, n = 8) {
+  return [...summaries]
+    .sort((a, b) => b.total_runtime_minutes - a.total_runtime_minutes)
+    .slice(0, n)
+    .map(s => s.machine_name);
+}
+
+// Pivot daily_rows into one object per calendar day with machine names as keys
+// (values in hours). Recharts stacked BarChart reads this shape directly.
+function getChartData(dailyRows, topKeys) {
+  const byDay = {};
+  for (const row of dailyRows) {
+    if (!topKeys.includes(row.machine_name)) continue;
+    // operational_day is an ISO datetime string — take the date part only.
+    const dayKey = row.operational_day.slice(0, 10);
+    if (!byDay[dayKey]) byDay[dayKey] = { day: dayKey };
+    byDay[dayKey][row.machine_name] = parseFloat((row.runtime_minutes / 60).toFixed(2));
+  }
+  return Object.values(byDay).sort((a, b) => a.day.localeCompare(b.day));
+}
+
+// Shape daily rows for the single-machine bar chart (hours per day).
+function getMachineChartData(dailyRows) {
+  return dailyRows.map(row => ({
+    day:   row.operational_day.slice(0, 10),
+    hours: parseFloat((row.runtime_minutes / 60).toFixed(2)),
+  }));
+}
+
+const AnalyticsPage = ({ token, onLogout }) => {
+  const [view, setView]                 = useState('fleet');   // 'fleet' | 'machine'
+  const [preset, setPreset]             = useState('7d');       // '7d'|'30d'|'90d'|'365d'|'custom'
+  const [fromDate, setFromDate]         = useState(() => {
+    const d = new Date(); d.setDate(d.getDate() - 6);
+    return d.toISOString().slice(0, 10);
+  });
+  const [toDate, setToDate]             = useState(() => new Date().toISOString().slice(0, 10));
+  const [selectedMachine, setSelectedMachine] = useState(MACHINES[0]);
+  const [rangeData, setRangeData]       = useState(null);
+  const [machineData, setMachineData]   = useState(null);
+  const [loading, setLoading]           = useState(false);
+  const [error, setError]               = useState(null);
+
+  // Update fromDate/toDate when a preset pill is clicked.
+  const applyPreset = (p) => {
+    setPreset(p);
+    if (p === 'custom') return;
+    const daysBack = { '7d': 6, '30d': 29, '90d': 89, '365d': 364 }[p];
+    const from = new Date(); from.setDate(from.getDate() - daysBack);
+    setFromDate(from.toISOString().slice(0, 10));
+    setToDate(new Date().toISOString().slice(0, 10));
+  };
+
+  // Fetch fleet runtime range whenever view, dates, or token change.
+  useEffect(() => {
+    if (view !== 'fleet' || !fromDate || !toDate) return;
+    setLoading(true); setError(null);
+    apiFetch(`/runtime/fleet/range?from_date=${fromDate}&to_date=${toDate}`, token)
+      .then(data => setRangeData(data))
+      .catch(e => { if (e.status === 401) onLogout(); else setError(e.message || 'Failed to load'); })
+      .finally(() => setLoading(false));
+  }, [view, fromDate, toDate, token, onLogout]);
+
+  // Fetch single-machine range whenever view, machine, or dates change.
+  useEffect(() => {
+    if (view !== 'machine' || !fromDate || !toDate || !selectedMachine) return;
+    setLoading(true); setError(null);
+    apiFetch(`/runtime/machines/${selectedMachine.id}/range?from_date=${fromDate}&to_date=${toDate}`, token)
+      .then(data => setMachineData(data))
+      .catch(e => { if (e.status === 401) onLogout(); else setError(e.message || 'Failed to load'); })
+      .finally(() => setLoading(false));
+  }, [view, fromDate, toDate, selectedMachine, token, onLogout]);
+
+  // Dark theme tokens (Analytics panel only — does not affect the rest of the app).
+  const dk = {
+    bg:     '#111827',
+    card:   '#1f2937',
+    text:   '#f9fafb',
+    muted:  '#6b7280',
+    border: '#374151',
+  };
+
+  const PRESETS = ['7d', '30d', '90d', '365d', 'custom'];
+
+  const topKeys         = rangeData   ? getTopMachineKeys(rangeData.summaries, 8) : [];
+  const chartData       = rangeData   ? getChartData(rangeData.daily_rows, topKeys) : [];
+  const machineChartData= machineData ? getMachineChartData(machineData.daily_rows) : [];
+
+  return (
+    <div style={{ background: dk.bg, borderRadius: 12, padding: '20px 24px', minHeight: 480, color: dk.text, fontFamily: 'inherit' }}>
+
+      {/* Controls bar */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center', marginBottom: 20, paddingBottom: 16, borderBottom: `1px solid ${dk.border}` }}>
+
+        {/* View toggle */}
+        <div style={{ display: 'flex', gap: 4 }}>
+          {[['fleet','All machines'],['machine','One machine']].map(([v, label]) => (
+            <button key={v} onClick={() => setView(v)} style={{
+              background: view === v ? C.red : dk.card,
+              color:  view === v ? '#fff' : dk.muted,
+              border: `1px solid ${view === v ? C.red : dk.border}`,
+              borderRadius: 6, padding: '5px 14px', fontSize: 13,
+              fontWeight: view === v ? 600 : 400, cursor: 'pointer', fontFamily: 'inherit',
+            }}>{label}</button>
+          ))}
+        </div>
+
+        {/* Date range presets */}
+        <div style={{ display: 'flex', gap: 4 }}>
+          {PRESETS.map(p => (
+            <button key={p} onClick={() => applyPreset(p)} style={{
+              background: preset === p ? dk.border : 'transparent',
+              color: preset === p ? dk.text : dk.muted,
+              border: `1px solid ${dk.border}`, borderRadius: 6,
+              padding: '4px 10px', fontSize: 12, cursor: 'pointer',
+              fontWeight: preset === p ? 600 : 400, fontFamily: 'inherit',
+            }}>{p === 'custom' ? 'Custom' : p}</button>
+          ))}
+        </div>
+
+        {/* Custom date pickers — visible only when preset === 'custom' */}
+        {preset === 'custom' && (
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
+              style={{ background: dk.card, color: dk.text, border: `1px solid ${dk.border}`, borderRadius: 6, padding: '4px 8px', fontSize: 12 }}
+            />
+            <span style={{ color: dk.muted, fontSize: 12 }}>to</span>
+            <input type="date" value={toDate} onChange={e => setToDate(e.target.value)}
+              style={{ background: dk.card, color: dk.text, border: `1px solid ${dk.border}`, borderRadius: 6, padding: '4px 8px', fontSize: 12 }}
+            />
+          </div>
+        )}
+
+        {/* Machine selector — only in machine view */}
+        {view === 'machine' && (
+          <select
+            value={selectedMachine.id}
+            onChange={e => setSelectedMachine(MACHINES.find(m => m.id === parseInt(e.target.value)))}
+            style={{ background: dk.card, color: dk.text, border: `1px solid ${dk.border}`, borderRadius: 6, padding: '4px 10px', fontSize: 13 }}
+          >
+            {MACHINES.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+          </select>
+        )}
+      </div>
+
+      {loading && (
+        <div style={{ textAlign: 'center', padding: 48, color: dk.muted }}>Loading…</div>
+      )}
+
+      {error && (
+        <div style={{ color: '#f87171', background: '#450a0a', borderRadius: 8, padding: '10px 16px', marginBottom: 16 }}>
+          ⚠ {error}
+        </div>
+      )}
+
+      {/* ── Fleet view ─────────────────────────────────────────── */}
+      {view === 'fleet' && rangeData && !loading && (
+        <>
+          {/* Stacked bar chart */}
+          <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${dk.border}` }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: dk.text, marginBottom: 4 }}>
+              Daily runtime — all machines
+            </div>
+            <div style={{ fontSize: 11, color: dk.muted, marginBottom: 16 }}>
+              {fromDate} → {toDate} · Hours per day · top 8 machines by total runtime
+            </div>
+            {chartData.length === 0 ? (
+              <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
+            ) : (
+              <ResponsiveContainer width="100%" height={260}>
+                <BarChart data={chartData} margin={{ top: 4, right: 8, left: -8, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={dk.border} vertical={false} />
+                  <XAxis dataKey="day" tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} />
+                  <YAxis tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} width={32} unit="h" />
+                  <Tooltip
+                    contentStyle={{ background: dk.card, border: `1px solid ${dk.border}`, borderRadius: 8, fontSize: 12 }}
+                    labelStyle={{ color: dk.text, fontWeight: 600 }}
+                    formatter={(v, name) => [`${v}h`, name]}
+                  />
+                  <Legend wrapperStyle={{ fontSize: 11, color: dk.muted }} />
+                  {topKeys.map((key, i) => (
+                    <Bar key={key} dataKey={key} stackId="a" fill={BAR_COLORS[i % BAR_COLORS.length]} />
+                  ))}
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+
+          {/* Summary table */}
+          <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', border: `1px solid ${dk.border}`, overflowX: 'auto' }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: dk.text, marginBottom: 16 }}>Machine summary</div>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+              <thead>
+                <tr style={{ color: dk.muted, borderBottom: `1px solid ${dk.border}` }}>
+                  {['Machine', 'Total runtime', 'Utilisation', 'Avg / day', 'Best day', 'Days w/ data'].map(h => (
+                    <th key={h} style={{ textAlign: 'left', padding: '6px 10px', fontWeight: 600 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rangeData.summaries.map(s => (
+                  <tr key={s.machine_id} style={{ borderBottom: `1px solid ${dk.border}`, color: dk.text }}>
+                    <td style={{ padding: '8px 10px', fontWeight: 600 }}>{s.machine_name}</td>
+                    <td style={{ padding: '8px 10px' }}>{fmtMinutes(s.total_runtime_minutes)}</td>
+                    <td style={{ padding: '8px 10px' }}>
+                      <span style={{ color: s.utilisation_pct >= 70 ? '#4ade80' : s.utilisation_pct >= 40 ? '#fbbf24' : '#f87171' }}>
+                        {s.utilisation_pct.toFixed(1)}%
+                      </span>
+                    </td>
+                    <td style={{ padding: '8px 10px' }}>{fmtMinutes(s.avg_runtime_per_day_minutes)}</td>
+                    <td style={{ padding: '8px 10px' }}>{fmtMinutes(s.best_day_runtime_minutes)}</td>
+                    <td style={{ padding: '8px 10px', color: dk.muted }}>{s.days_with_data}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {/* ── Machine view ────────────────────────────────────────── */}
+      {view === 'machine' && machineData && !loading && (
+        <>
+          {/* Daily runtime bar chart for one machine */}
+          <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${dk.border}` }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: dk.text, marginBottom: 4 }}>
+              {machineData.machine_name} — daily runtime
+            </div>
+            <div style={{ fontSize: 11, color: dk.muted, marginBottom: 16 }}>
+              {fromDate} → {toDate} · Hours running per operational day (max 24 h)
+            </div>
+            {machineChartData.length === 0 ? (
+              <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
+            ) : (
+              <ResponsiveContainer width="100%" height={260}>
+                <BarChart data={machineChartData} margin={{ top: 4, right: 8, left: -8, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={dk.border} vertical={false} />
+                  <XAxis dataKey="day" tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} />
+                  <YAxis tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} width={32} domain={[0, 24]} unit="h" />
+                  <Tooltip
+                    contentStyle={{ background: dk.card, border: `1px solid ${dk.border}`, borderRadius: 8, fontSize: 12 }}
+                    labelStyle={{ color: dk.text, fontWeight: 600 }}
+                    formatter={v => [`${v}h`, 'Runtime']}
+                  />
+                  <Bar dataKey="hours" fill={C.red} radius={[2, 2, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+
+          {/* Summary stat cards */}
+          {(() => {
+            const s = machineData.summary;
+            return (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12 }}>
+                {[
+                  { label: 'Total runtime',  val: fmtMinutes(s.total_runtime_minutes)         },
+                  { label: 'Utilisation',    val: `${s.utilisation_pct.toFixed(1)}%`          },
+                  { label: 'Avg / day',      val: fmtMinutes(s.avg_runtime_per_day_minutes)   },
+                  { label: 'Best day',       val: fmtMinutes(s.best_day_runtime_minutes)      },
+                  { label: 'Worst day',      val: fmtMinutes(s.worst_day_runtime_minutes)     },
+                  { label: 'Days with data', val: `${s.days_with_data}`                       },
+                ].map(card => (
+                  <div key={card.label} style={{ background: dk.card, borderRadius: 10, padding: '14px 16px', border: `1px solid ${dk.border}` }}>
+                    <div style={{ fontSize: 10, color: dk.muted, marginBottom: 5, fontWeight: 500, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                      {card.label}
+                    </div>
+                    <div style={{ fontSize: 20, fontWeight: 800, color: dk.text, fontVariantNumeric: 'tabular-nums' }}>
+                      {card.val}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+        </>
+      )}
     </div>
   );
 };
