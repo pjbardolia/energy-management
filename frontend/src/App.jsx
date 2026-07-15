@@ -599,19 +599,10 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
           ))}
         </div>
 
-        {/* Staleness banner — shown when any machine has stale data.
-            Not dismissible: disappears automatically when fresh data arrives.
-            Amber = warning, not fault (the API itself is working fine). */}
-        {fleet.some(m => isStale(m.last_updated)) && (() => {
-          const validTs = fleet
-            .filter(m => m.last_updated)
-            .map(m => new Date(
-              m.last_updated.endsWith("Z") ? m.last_updated : m.last_updated + "Z"
-            ).getTime());
-          const oldestMs = validTs.length ? Math.max(...validTs) : null;
-          const agoText  = oldestMs
-            ? lastSeenText(new Date(oldestMs).toISOString())
-            : "unknown";
+        {/* Gateway offline banner — driven by heartbeat, not individual machine staleness.
+            A single machine with a Modbus timeout shows STALE on its tile; the fleet
+            banner is reserved for the case where the gateway itself is unreachable. */}
+        {(gatewayStatus !== null && !gatewayStatus.is_online) && (() => {
           return (
             <div style={{
               background:"#FFFBEB", border:"1px solid #FDE68A", borderRadius:8,
@@ -619,7 +610,7 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
               color:"#92400E", fontSize:13, lineHeight:1.6,
             }}>
               <div style={{fontWeight:700,marginBottom:2}}>
-                ⚠ Gateway data is stale — last reading received {agoText}.
+                ⚠ Gateway offline — last seen {lastSeenText(gatewayStatus?.last_seen)}.
               </div>
               <div style={{fontSize:12,opacity:.85}}>
                 The gateway may be offline or the factory internet connection may be down.
