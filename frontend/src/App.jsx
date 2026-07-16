@@ -111,6 +111,12 @@ function getMachineRuntime(machineId, shiftRuntime) {
   return shiftRuntime.find(r => r.machine_id === machineId) || null;
 }
 
+// Look up shift energy for one machine in the shiftEnergy array from
+// /energy/fleet/current-shift — returns null when the machine is not found.
+function getMachineEnergy(machineId, shiftEnergy) {
+  return shiftEnergy.find(r => r.machine_id === machineId) || null;
+}
+
 // Four machine states, priority: STALE > RUNNING > STOPPED > NO_DATA.
 // STOPPED VFDs still report real Modbus values (0 Hz, 0 A, ~565 V DC bus)
 // so STOPPED must show real fmt() values, not "—".
@@ -376,7 +382,7 @@ const LoginPage = ({onLogin}) => {
 /* ═══════════════════════════════════════════════════════════════
    MACHINE TILE
 ═══════════════════════════════════════════════════════════════ */
-const Tile = ({machine, onClick, runtime}) => {
+const Tile = ({machine, onClick, runtime, energy}) => {
   // getMachineState() encodes four states: STALE > RUNNING > STOPPED > NO_DATA.
   // STOPPED VFDs report real 0 Hz / 0 A / ~565 V — show those values, not dashes.
   const state = getMachineState(machine);
@@ -472,6 +478,23 @@ const Tile = ({machine, onClick, runtime}) => {
       {/* Shift runtime bar — hidden until 5+ minutes of shift data */}
       <RuntimeBar runtime={runtime} />
 
+      {/* Energy line — kWh and estimated cost for the current shift.
+          Hidden when kwh_consumed < 0.01 (no meaningful data yet). */}
+      {energy && energy.kwh_consumed >= 0.01 && (() => {
+        const shiftLabel = energy.shift === 'day' ? 'Day' : 'Night';
+        return (
+          <div style={{ fontSize: 11, color: C.muted, marginTop: 2, marginBottom: 4 }}>
+            {shiftLabel} energy:{' '}
+            <span style={{ color: C.text, fontWeight: 600 }}>
+              {energy.kwh_consumed.toFixed(1)} kWh
+            </span>
+            <span style={{ marginLeft: 6, color: C.muted }}>
+              ≈ ₹{energy.cost_inr.toFixed(0)}
+            </span>
+          </div>
+        );
+      })()}
+
       {/* Footer — amber relative time when stale; IST clock time when fresh */}
       <div style={{
         borderTop:`1px solid ${C.border}`,paddingTop:9,
@@ -498,6 +521,7 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
   const [error, setError]           = useState(null);
   const [gatewayStatus, setGatewayStatus] = useState(null);
   const [shiftRuntime, setShiftRuntime]   = useState([]);
+  const [shiftEnergy, setShiftEnergy]     = useState([]);
   // 'fleet' shows the machine grid; 'analytics' shows the AnalyticsPage panel.
   const [activePage, setActivePage] = useState('fleet');
 
@@ -525,6 +549,19 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
     };
     fetchRuntime();
     const id = setInterval(fetchRuntime, 60_000);
+    return () => clearInterval(id);
+  }, [token]);
+
+  // Poll shift energy every 60 s — feeds the kWh/cost line on each machine tile.
+  useEffect(() => {
+    if (!token) return;
+    const fetchEnergy = () => {
+      apiFetch('/energy/fleet/current-shift', token)
+        .then(data => setShiftEnergy(Array.isArray(data) ? data : []))
+        .catch(() => {});
+    };
+    fetchEnergy();
+    const id = setInterval(fetchEnergy, 60_000);
     return () => clearInterval(id);
   }, [token]);
 
@@ -719,6 +756,7 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
                     machine={m}
                     onClick={()=>onSelect(m)}
                     runtime={getMachineRuntime(m.machine_id, shiftRuntime)}
+                    energy={getMachineEnergy(m.machine_id, shiftEnergy)}
                   />
                 ))}
               </div>
@@ -1026,10 +1064,13 @@ const AnalyticsPage = ({ token, onLogout }) => {
   });
   const [toDate, setToDate]             = useState(() => new Date().toISOString().slice(0, 10));
   const [selectedMachine, setSelectedMachine] = useState(MACHINES[0]);
-  const [rangeData, setRangeData]       = useState(null);
-  const [machineData, setMachineData]   = useState(null);
-  const [loading, setLoading]           = useState(false);
-  const [error, setError]               = useState(null);
+  const [rangeData, setRangeData]               = useState(null);
+  const [machineData, setMachineData]           = useState(null);
+  const [energyRangeData, setEnergyRangeData]   = useState(null);
+  const [machineEnergyData, setMachineEnergyData] = useState(null);
+  const [loading, setLoading]                   = useState(false);
+  const [error, setError]                       = useState(null);
+  const [analyticsTab, setAnalyticsTab]         = useState('runtime'); // 'runtime' | 'energy'
 
   // Update fromDate/toDate when a preset pill is clicked.
   const applyPreset = (p) => {
@@ -1041,25 +1082,31 @@ const AnalyticsPage = ({ token, onLogout }) => {
     setToDate(new Date().toISOString().slice(0, 10));
   };
 
-  // Fetch fleet runtime range whenever view, dates, or token change.
+  // Fetch fleet data (runtime or energy) whenever view, dates, tab, or token change.
   useEffect(() => {
     if (view !== 'fleet' || !fromDate || !toDate) return;
     setLoading(true); setError(null);
-    apiFetch(`/runtime/fleet/range?from_date=${fromDate}&to_date=${toDate}`, token)
-      .then(data => setRangeData(data))
+    const url = analyticsTab === 'energy'
+      ? `/energy/fleet/range?from_date=${fromDate}&to_date=${toDate}`
+      : `/runtime/fleet/range?from_date=${fromDate}&to_date=${toDate}`;
+    apiFetch(url, token)
+      .then(data => { if (analyticsTab === 'energy') setEnergyRangeData(data); else setRangeData(data); })
       .catch(e => { if (e.status === 401) onLogout(); else setError(e.message || 'Failed to load'); })
       .finally(() => setLoading(false));
-  }, [view, fromDate, toDate, token, onLogout]);
+  }, [view, fromDate, toDate, token, onLogout, analyticsTab]);
 
-  // Fetch single-machine range whenever view, machine, or dates change.
+  // Fetch single-machine data (runtime or energy) whenever view, machine, dates, or tab change.
   useEffect(() => {
     if (view !== 'machine' || !fromDate || !toDate || !selectedMachine) return;
     setLoading(true); setError(null);
-    apiFetch(`/runtime/machines/${selectedMachine.id}/range?from_date=${fromDate}&to_date=${toDate}`, token)
-      .then(data => setMachineData(data))
+    const url = analyticsTab === 'energy'
+      ? `/energy/machines/${selectedMachine.id}/range?from_date=${fromDate}&to_date=${toDate}`
+      : `/runtime/machines/${selectedMachine.id}/range?from_date=${fromDate}&to_date=${toDate}`;
+    apiFetch(url, token)
+      .then(data => { if (analyticsTab === 'energy') setMachineEnergyData(data); else setMachineData(data); })
       .catch(e => { if (e.status === 401) onLogout(); else setError(e.message || 'Failed to load'); })
       .finally(() => setLoading(false));
-  }, [view, fromDate, toDate, selectedMachine, token, onLogout]);
+  }, [view, fromDate, toDate, selectedMachine, token, onLogout, analyticsTab]);
 
   // Dark theme tokens (Analytics panel only — does not affect the rest of the app).
   const dk = {
@@ -1078,6 +1125,19 @@ const AnalyticsPage = ({ token, onLogout }) => {
 
   return (
     <div style={{ background: dk.bg, borderRadius: 12, padding: '20px 24px', minHeight: 480, color: dk.text, fontFamily: 'inherit' }}>
+
+      {/* Runtime / Energy tab toggle */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 16 }}>
+        {[['runtime', 'Runtime'], ['energy', 'Energy & Cost']].map(([val, label]) => (
+          <button key={val} onClick={() => setAnalyticsTab(val)} style={{
+            padding: '6px 16px', borderRadius: 6, fontSize: 14, fontFamily: 'inherit',
+            background: analyticsTab === val ? C.red : 'transparent',
+            color:      analyticsTab === val ? '#fff' : dk.muted,
+            border:     `1px solid ${analyticsTab === val ? C.red : dk.border}`,
+            cursor: 'pointer', fontWeight: analyticsTab === val ? 600 : 400,
+          }}>{label}</button>
+        ))}
+      </div>
 
       {/* Controls bar */}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center', marginBottom: 20, paddingBottom: 16, borderBottom: `1px solid ${dk.border}` }}>
@@ -1143,8 +1203,8 @@ const AnalyticsPage = ({ token, onLogout }) => {
         </div>
       )}
 
-      {/* ── Fleet view ─────────────────────────────────────────── */}
-      {view === 'fleet' && rangeData && !loading && (
+      {/* ── Fleet view — Runtime tab ───────────────────────────── */}
+      {analyticsTab === 'runtime' && view === 'fleet' && rangeData && !loading && (
         <>
           {/* Stacked bar chart */}
           <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${dk.border}` }}>
@@ -1208,8 +1268,8 @@ const AnalyticsPage = ({ token, onLogout }) => {
         </>
       )}
 
-      {/* ── Machine view ────────────────────────────────────────── */}
-      {view === 'machine' && machineData && !loading && (
+      {/* ── Machine view — Runtime tab ──────────────────────────── */}
+      {analyticsTab === 'runtime' && view === 'machine' && machineData && !loading && (
         <>
           {/* Daily runtime bar chart for one machine */}
           <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${dk.border}` }}>
@@ -1265,6 +1325,158 @@ const AnalyticsPage = ({ token, onLogout }) => {
           })()}
         </>
       )}
+
+      {/* ── Fleet view — Energy tab ─────────────────────────────── */}
+      {analyticsTab === 'energy' && view === 'fleet' && energyRangeData && !loading && (() => {
+        // Build chart data: one object per day, machine names (short form) as keys.
+        const byDay = {};
+        energyRangeData.daily_rows.forEach(row => {
+          const day = row.operational_day.slice(0, 10);
+          if (!byDay[day]) byDay[day] = { day };
+          const key = row.machine_name.replace('Jet ', 'J');
+          byDay[day][key] = parseFloat(row.kwh_consumed.toFixed(1));
+        });
+        const energyChartData = Object.values(byDay).sort((a, b) => a.day.localeCompare(b.day));
+        const machineKeys = [...energyRangeData.summaries]
+          .sort((a, b) => b.total_kwh - a.total_kwh)
+          .slice(0, 8)
+          .map(s => s.machine_name.replace('Jet ', 'J'));
+
+        const totalKwh  = energyRangeData.summaries.reduce((a, s) => a + s.total_kwh, 0);
+        const totalCost = energyRangeData.summaries.reduce((a, s) => a + s.total_cost_inr, 0);
+
+        return (
+          <>
+            {/* Stacked kWh bar chart */}
+            <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${dk.border}` }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: dk.text, marginBottom: 4 }}>
+                Energy consumption (kWh) — top 8 machines
+              </div>
+              <div style={{ fontSize: 11, color: dk.muted, marginBottom: 16 }}>
+                {fromDate} → {toDate} · kWh per operational day · tariff ₹{energyRangeData.tariff_per_kwh_inr}/kWh
+              </div>
+              {energyChartData.length === 0 ? (
+                <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
+              ) : (
+                <ResponsiveContainer width="100%" height={320}>
+                  <BarChart data={energyChartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={dk.border} vertical={false} />
+                    <XAxis dataKey="day" tick={{ fill: dk.muted, fontSize: 10 }} tickLine={false} axisLine={false}
+                      tickFormatter={d => d.slice(5)} />
+                    <YAxis tick={{ fill: dk.muted, fontSize: 10 }} tickLine={false} axisLine={false}
+                      tickFormatter={v => `${v}kWh`} />
+                    <Tooltip
+                      contentStyle={{ background: dk.card, border: `1px solid ${dk.border}`, borderRadius: 8, fontSize: 12 }}
+                      labelStyle={{ color: dk.text, fontWeight: 600 }}
+                      formatter={(val, name) => [`${val} kWh`, `Jet ${name.replace('J', '')}`]}
+                      labelFormatter={l => `Op. day: ${l}`}
+                    />
+                    <Legend formatter={name => `Jet ${name.replace('J', '')}`}
+                      wrapperStyle={{ fontSize: 11, color: dk.muted }} />
+                    {machineKeys.map((key, i) => (
+                      <Bar key={key} dataKey={key} stackId="a"
+                        fill={BAR_COLORS[i % BAR_COLORS.length]} maxBarSize={40} />
+                    ))}
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+
+            {/* Cost summary table */}
+            <div style={{ background: dk.card, borderRadius: 12, overflow: 'hidden', border: `1px solid ${dk.border}` }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ borderBottom: `1px solid ${dk.border}` }}>
+                    {['Machine', 'Total kWh', 'Total Cost (₹)', 'Avg kWh / Day', 'Peak Day'].map(h => (
+                      <th key={h} style={{ padding: '10px 16px', textAlign: 'left',
+                        color: dk.muted, fontWeight: 600, fontSize: 12 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {energyRangeData.summaries.map((s, i) => (
+                    <tr key={s.machine_id} style={{ borderBottom: `1px solid ${dk.border}`,
+                      background: i % 2 === 0 ? 'transparent' : '#0d1117' }}>
+                      <td style={{ padding: '10px 16px', color: dk.text, fontWeight: 600 }}>{s.machine_name}</td>
+                      <td style={{ padding: '10px 16px', color: dk.text }}>{s.total_kwh.toFixed(1)}</td>
+                      <td style={{ padding: '10px 16px', color: '#22c55e', fontWeight: 600 }}>
+                        ₹{s.total_cost_inr.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
+                      </td>
+                      <td style={{ padding: '10px 16px', color: '#d1d5db' }}>{s.avg_kwh_per_day.toFixed(1)} kWh</td>
+                      <td style={{ padding: '10px 16px', color: '#f59e0b' }}>{s.peak_day_kwh.toFixed(1)} kWh</td>
+                    </tr>
+                  ))}
+                  {/* Fleet total row */}
+                  <tr style={{ borderTop: `2px solid ${dk.border}`, background: '#0d1117' }}>
+                    <td style={{ padding: '10px 16px', color: dk.text, fontWeight: 700 }}>TOTAL</td>
+                    <td style={{ padding: '10px 16px', color: dk.text, fontWeight: 700 }}>{totalKwh.toFixed(1)}</td>
+                    <td style={{ padding: '10px 16px', color: '#22c55e', fontWeight: 700 }}>
+                      ₹{totalCost.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
+                    </td>
+                    <td colSpan={2} />
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </>
+        );
+      })()}
+
+      {/* ── Machine view — Energy tab ───────────────────────────── */}
+      {analyticsTab === 'energy' && view === 'machine' && machineEnergyData && !loading && (() => {
+        const s = machineEnergyData.summary;
+        // Daily kWh bar chart for one machine
+        const energyMachineChartData = machineEnergyData.daily_rows.map(row => ({
+          day: row.operational_day.slice(0, 10),
+          kwh: parseFloat(row.kwh_consumed.toFixed(2)),
+        }));
+        return (
+          <>
+            <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${dk.border}` }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: dk.text, marginBottom: 4 }}>
+                {machineEnergyData.machine_name} — daily energy consumption
+              </div>
+              <div style={{ fontSize: 11, color: dk.muted, marginBottom: 16 }}>
+                {fromDate} → {toDate} · kWh per operational day · ₹{machineEnergyData.tariff_per_kwh_inr}/kWh
+              </div>
+              {energyMachineChartData.length === 0 ? (
+                <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
+              ) : (
+                <ResponsiveContainer width="100%" height={260}>
+                  <BarChart data={energyMachineChartData} margin={{ top: 4, right: 8, left: -8, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={dk.border} vertical={false} />
+                    <XAxis dataKey="day" tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} />
+                    <YAxis tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} width={40} unit=" kWh" />
+                    <Tooltip
+                      contentStyle={{ background: dk.card, border: `1px solid ${dk.border}`, borderRadius: 8, fontSize: 12 }}
+                      labelStyle={{ color: dk.text, fontWeight: 600 }}
+                      formatter={v => [`${v} kWh`, 'Energy']}
+                    />
+                    <Bar dataKey="kwh" fill={C.red} radius={[2, 2, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+
+            {/* Summary cards */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginTop: 8 }}>
+              {[
+                { label: 'Total Energy', value: `${s.total_kwh.toFixed(1)} kWh`                 },
+                { label: 'Total Cost',   value: `₹${s.total_cost_inr.toFixed(0)}`, color: '#22c55e' },
+                { label: 'Avg / Op-Day', value: `${s.avg_kwh_per_day.toFixed(1)} kWh`          },
+                { label: 'Peak Day',     value: `${s.peak_day_kwh.toFixed(1)} kWh`, color: '#f59e0b' },
+              ].map(card => (
+                <div key={card.label} style={{ background: dk.card, borderRadius: 10, padding: '16px 20px', border: `1px solid ${dk.border}` }}>
+                  <div style={{ fontSize: 12, color: dk.muted, marginBottom: 6 }}>{card.label}</div>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: card.color || dk.text }}>
+                    {card.value}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        );
+      })()}
     </div>
   );
 };
