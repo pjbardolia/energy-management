@@ -34,6 +34,7 @@ from routers.data_router import router as data_router
 from routers.telemetry_read import router as telemetry_read_router
 from routers.gateway_heartbeat import router as gateway_heartbeat_router
 from routers.runtime import router as runtime_router
+from routers.energy import router as energy_router
 from services.alert_scheduler import start_alert_scheduler
 
 from passlib.context import CryptContext
@@ -83,6 +84,7 @@ app.include_router(data_router)                # POST/GET /data
 app.include_router(telemetry_read_router)      # GET /machines/live, /fleet/summary
 app.include_router(gateway_heartbeat_router)  # POST /gateway/heartbeat, GET /gateway/status
 app.include_router(runtime_router)            # GET /runtime/fleet/current-shift, /fleet/range, /machines/{id}/range
+app.include_router(energy_router)             # GET /energy/fleet/current-shift, /fleet/range, /machines/{id}/range
 
 # Password hashing context — bcrypt==4.0.1 is pinned in requirements.txt
 # because newer bcrypt versions break passlib's internal API.
