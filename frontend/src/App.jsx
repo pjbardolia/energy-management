@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
 import {
-  AreaChart, Area, XAxis, YAxis,
-  CartesianGrid, Tooltip, ResponsiveContainer,
-  BarChart, Bar, Legend,
+  AreaChart, Area,
+  LineChart, Line,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from "recharts";
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1217,21 +1217,32 @@ const AnalyticsPage = ({ token, onLogout }) => {
             {chartData.length === 0 ? (
               <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
             ) : (
-              <ResponsiveContainer width="100%" height={260}>
-                <BarChart data={chartData} margin={{ top: 4, right: 8, left: -8, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke={dk.border} vertical={false} />
-                  <XAxis dataKey="day" tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} />
-                  <YAxis tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} width={32} unit="h" />
+              <ResponsiveContainer width="100%" height={320}>
+                <LineChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
+                  <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
+                    tickFormatter={d => d.slice(5)} />
+                  <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
+                    tickFormatter={v => `${v}h`} />
                   <Tooltip
-                    contentStyle={{ background: dk.card, border: `1px solid ${dk.border}`, borderRadius: 8, fontSize: 12 }}
-                    labelStyle={{ color: dk.text, fontWeight: 600 }}
-                    formatter={(v, name) => [`${v}h`, name]}
+                    contentStyle={{ background: '#1f2937', border: '1px solid #374151',
+                      borderRadius: 8, fontSize: 12 }}
+                    formatter={(val, name) => [`${val}h`, name]}
+                    labelFormatter={l => `Op. day: ${l}`}
                   />
-                  <Legend wrapperStyle={{ fontSize: 11, color: dk.muted }} />
+                  <Legend wrapperStyle={{ fontSize: 11, color: '#9ca3af' }} />
                   {topKeys.map((key, i) => (
-                    <Bar key={key} dataKey={key} stackId="a" fill={BAR_COLORS[i % BAR_COLORS.length]} />
+                    <Line
+                      key={key}
+                      type="monotone"
+                      dataKey={key}
+                      stroke={BAR_COLORS[i % BAR_COLORS.length]}
+                      strokeWidth={2}
+                      dot={false}
+                      activeDot={{ r: 4 }}
+                    />
                   ))}
-                </BarChart>
+                </LineChart>
               </ResponsiveContainer>
             )}
           </div>
@@ -1282,18 +1293,28 @@ const AnalyticsPage = ({ token, onLogout }) => {
             {machineChartData.length === 0 ? (
               <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
             ) : (
-              <ResponsiveContainer width="100%" height={260}>
-                <BarChart data={machineChartData} margin={{ top: 4, right: 8, left: -8, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke={dk.border} vertical={false} />
-                  <XAxis dataKey="day" tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} />
-                  <YAxis tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} width={32} domain={[0, 24]} unit="h" />
+              <ResponsiveContainer width="100%" height={280}>
+                <LineChart data={machineChartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
+                  <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
+                    tickFormatter={d => d.slice(5)} />
+                  <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
+                    tickFormatter={v => `${v}h`} domain={[0, 'auto']} />
                   <Tooltip
-                    contentStyle={{ background: dk.card, border: `1px solid ${dk.border}`, borderRadius: 8, fontSize: 12 }}
-                    labelStyle={{ color: dk.text, fontWeight: 600 }}
-                    formatter={v => [`${v}h`, 'Runtime']}
+                    contentStyle={{ background: '#1f2937', border: '1px solid #374151',
+                      borderRadius: 8, fontSize: 12 }}
+                    formatter={val => [`${val}h`, 'Runtime']}
+                    labelFormatter={l => `Op. day: ${l}`}
                   />
-                  <Bar dataKey="hours" fill={C.red} radius={[2, 2, 0, 0]} />
-                </BarChart>
+                  <Line
+                    type="monotone"
+                    dataKey="hours"
+                    stroke={C.red}
+                    strokeWidth={2}
+                    dot={{ fill: C.red, r: 3 }}
+                    activeDot={{ r: 5 }}
+                  />
+                </LineChart>
               </ResponsiveContainer>
             )}
           </div>
@@ -1359,25 +1380,32 @@ const AnalyticsPage = ({ token, onLogout }) => {
                 <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
               ) : (
                 <ResponsiveContainer width="100%" height={320}>
-                  <BarChart data={energyChartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke={dk.border} vertical={false} />
-                    <XAxis dataKey="day" tick={{ fill: dk.muted, fontSize: 10 }} tickLine={false} axisLine={false}
+                  <LineChart data={energyChartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
+                    <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
                       tickFormatter={d => d.slice(5)} />
-                    <YAxis tick={{ fill: dk.muted, fontSize: 10 }} tickLine={false} axisLine={false}
+                    <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
                       tickFormatter={v => `${v}kWh`} />
                     <Tooltip
-                      contentStyle={{ background: dk.card, border: `1px solid ${dk.border}`, borderRadius: 8, fontSize: 12 }}
-                      labelStyle={{ color: dk.text, fontWeight: 600 }}
+                      contentStyle={{ background: '#1f2937', border: '1px solid #374151',
+                        borderRadius: 8, fontSize: 12 }}
                       formatter={(val, name) => [`${val} kWh`, `Jet ${name.replace('J', '')}`]}
                       labelFormatter={l => `Op. day: ${l}`}
                     />
                     <Legend formatter={name => `Jet ${name.replace('J', '')}`}
-                      wrapperStyle={{ fontSize: 11, color: dk.muted }} />
+                      wrapperStyle={{ fontSize: 11, color: '#9ca3af' }} />
                     {machineKeys.map((key, i) => (
-                      <Bar key={key} dataKey={key} stackId="a"
-                        fill={BAR_COLORS[i % BAR_COLORS.length]} maxBarSize={40} />
+                      <Line
+                        key={key}
+                        type="monotone"
+                        dataKey={key}
+                        stroke={BAR_COLORS[i % BAR_COLORS.length]}
+                        strokeWidth={2}
+                        dot={false}
+                        activeDot={{ r: 4 }}
+                      />
                     ))}
-                  </BarChart>
+                  </LineChart>
                 </ResponsiveContainer>
               )}
             </div>
@@ -1442,18 +1470,28 @@ const AnalyticsPage = ({ token, onLogout }) => {
               {energyMachineChartData.length === 0 ? (
                 <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
               ) : (
-                <ResponsiveContainer width="100%" height={260}>
-                  <BarChart data={energyMachineChartData} margin={{ top: 4, right: 8, left: -8, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke={dk.border} vertical={false} />
-                    <XAxis dataKey="day" tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} />
-                    <YAxis tick={{ fontSize: 10, fill: dk.muted }} tickLine={false} axisLine={false} width={40} unit=" kWh" />
+                <ResponsiveContainer width="100%" height={280}>
+                  <LineChart data={energyMachineChartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
+                    <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
+                      tickFormatter={d => d.slice(5)} />
+                    <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
+                      tickFormatter={v => `${v}kWh`} />
                     <Tooltip
-                      contentStyle={{ background: dk.card, border: `1px solid ${dk.border}`, borderRadius: 8, fontSize: 12 }}
-                      labelStyle={{ color: dk.text, fontWeight: 600 }}
-                      formatter={v => [`${v} kWh`, 'Energy']}
+                      contentStyle={{ background: '#1f2937', border: '1px solid #374151',
+                        borderRadius: 8, fontSize: 12 }}
+                      formatter={val => [`${val} kWh`, 'Energy']}
+                      labelFormatter={l => `Op. day: ${l}`}
                     />
-                    <Bar dataKey="kwh" fill={C.red} radius={[2, 2, 0, 0]} />
-                  </BarChart>
+                    <Line
+                      type="monotone"
+                      dataKey="kwh"
+                      stroke={C.red}
+                      strokeWidth={2}
+                      dot={{ fill: C.red, r: 3 }}
+                      activeDot={{ r: 5 }}
+                    />
+                  </LineChart>
                 </ResponsiveContainer>
               )}
             </div>
