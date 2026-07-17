@@ -1,22 +1,23 @@
 """
-Phase 5a — Production Gateway Service (multi-device)
-======================================================
-Polls 14 VFDs across three models on a single RS485 bus, buffers every reading
-to a local SQLite outbox, and forwards them to the cloud API via HTTPS POST.
+Phase 5b — Production Gateway Service (multi-bus)
+==================================================
+Polls VFDs and sensors across multiple RS485 buses, buffers every reading to a
+local SQLite outbox, and forwards them to the cloud API via HTTPS POST.
 
 Architecture (ADR-006):
-    Modbus Poller → SQLite outbox buffer → HTTPS Forwarder → POST /data
+    Modbus Poller (per bus) → SQLite outbox buffer → HTTPS Forwarder → POST /data
 
-Supported VFD models (register maps are defined in VFD_REGISTER_MAPS below —
-they are hardware specs, not deployment config, so they live in code):
-  - INVT_CHF100A  : 8 registers at 0x3000
-  - YASKAWA_A1000 : 36 registers at 0x0023 (idx 1=Hz, 2=V, 3=A, 4=kW, 35=Vdc)
-  - YASKAWA_V1000 : same spec as A1000
-  - YASKAWA_F7    : same spec as A1000
+Supported device models (register maps live in VFD_REGISTER_MAPS below —
+hardware specs belong in code, deployment config belongs in config.json):
+  - INVT_CHF100A   : 8 registers at 0x3000
+  - YASKAWA_A1000  : 5 registers at 0x0023 + extra read at 0x0046 (dc_voltage)
+  - YASKAWA_V1000  : same spec as A1000
+  - YASKAWA_F7     : same spec as A1000
+  - DELTA_CP2000   : 4 registers at 0x2103 + extra read at 0x210B (torque/rpm/power)
+  - ELECTROSIL_FX438 : 1 register at 0x0000 (process temperature)
 
-Device roster (which slave ID maps to which model and component_instance_id)
-and all RS485/API parameters live in config.json — no code changes are needed
-to add, remove, or reconfigure a device.
+Bus configuration (port, baudrate, devices list) lives in config.json under the
+"buses" array — add, remove, or reconfigure any bus without touching this file.
 
 Run manually on Pi to verify:
     python3 gateway_service.py
@@ -163,14 +164,58 @@ _YASKAWA_SPEC = {
     ],
 }
 
+# Delta CP2000 — two non-consecutive register blocks.
+# Source: CP2000 manual Chapter 12, address list p.12-142.
+# Verified scaling: frequency XXX.XX (÷100), current AXXX.X (÷10),
+#                   voltage XXX.X (÷10), power X.XXX kW (÷1000).
+# NOTE: divisor for power is 1000 (NOT 100 like INVT CHF100A) — the CP2000
+# encodes kW in the format X.XXX, so raw=1234 → 1.234 kW.
+_DELTA_CP2000_SPEC = {
+    "address": 0x2103,   # Primary block: freq, current, dc_bus, output_v
+    "count":   4,
+    "registers": [
+        ("frequency",      0, 100),  # Output frequency   / 100 → Hz
+        ("current",        1,  10),  # Output current     / 10  → A
+        ("dc_voltage",     2,  10),  # DC bus voltage     / 10  → V
+        ("output_voltage", 3,  10),  # Output voltage     / 10  → V
+    ],
+    "extra_reads": [
+        {
+            "address": 0x210B,   # Second block: torque, rpm, reserved×2, power
+            "count":   5,        # Read 5 registers; indices 2 and 3 are reserved
+            "registers": [
+                ("torque", 0,  10),   # Output torque  / 10   → %
+                ("rpm",    1,   1),   # Motor speed    raw    → rpm
+                # index 2 = 0x210D Reserved — not listed, never accessed
+                # index 3 = 0x210E Reserved — not listed, never accessed
+                ("power",  4, 1000),  # Output power   / 1000 → kW
+            ],
+        },
+    ],
+}
+
+# Electrosil Fx-438 PID temperature controller (dyebath temperature sensor).
+# Register 0x0000 = Process Value (current measured temperature).
+# Source: Electrosil Fx-438 manual + standard PID controller convention.
+# Raw value / 10 = °C  (e.g. 260 → 26.0 °C).
+_ELECTROSIL_FX438_SPEC = {
+    "address": 0x0000,
+    "count":   1,
+    "registers": [
+        ("temperature", 0, 10),  # Process value / 10 → °C
+    ],
+}
+
 # Master lookup: vfd_model string (as used in config.json) → register spec.
 # YASKAWA_A1000 and YASKAWA_V1000 point to the same spec object — they are
 # kept as separate model names so the device list is self-documenting.
 VFD_REGISTER_MAPS = {
-    "INVT_CHF100A":   _INVT_CHF100A_SPEC,
-    "YASKAWA_A1000": _YASKAWA_SPEC,
-    "YASKAWA_V1000": _YASKAWA_SPEC,   # same layout as A1000
-    "YASKAWA_F7":    _YASKAWA_SPEC,
+    "INVT_CHF100A":     _INVT_CHF100A_SPEC,
+    "YASKAWA_A1000":    _YASKAWA_SPEC,
+    "YASKAWA_V1000":    _YASKAWA_SPEC,      # same layout as A1000
+    "YASKAWA_F7":       _YASKAWA_SPEC,
+    "DELTA_CP2000":     _DELTA_CP2000_SPEC,
+    "ELECTROSIL_FX438": _ELECTROSIL_FX438_SPEC,
 }
 
 
@@ -185,15 +230,16 @@ _REQUIRED_TOP_KEYS = [
     "api_base_url",
     "api_username",
     "api_password",
-    "modbus_port",
-    "modbus_baudrate",
     "polling_interval_seconds",
     "company_id",
-    "tag_definition_ids",   # {tag_name: tag_definition_id} — same across all devices
-    "devices",              # list of device dicts
+    "tag_definition_ids",  # {tag_name: tag_definition_id} — same across all buses
+    "buses",               # list of bus dicts, each with port + devices list
 ]
 
-# Keys required inside each device entry in the "devices" list.
+# Keys required inside each bus entry.
+_REQUIRED_BUS_KEYS = ["port", "baudrate", "parity", "stopbits", "devices"]
+
+# Keys required inside each device entry within a bus.
 _REQUIRED_DEVICE_KEYS = ["name", "slave_id", "vfd_model", "component_instance_id"]
 
 
@@ -201,8 +247,8 @@ def load_config() -> dict:
     """Load and validate config.json.
 
     Raises FileNotFoundError if config.json is absent.
-    Raises ValueError if required keys are missing or any device entry is
-    malformed or references an unknown vfd_model.
+    Raises ValueError if required keys are missing, any bus/device entry is
+    malformed, or a device references an unknown vfd_model.
     Never logs credentials.
     """
     if not os.path.exists(_CONFIG_PATH):
@@ -224,49 +270,73 @@ def load_config() -> dict:
     if not isinstance(config["tag_definition_ids"], dict) or not config["tag_definition_ids"]:
         raise ValueError("config.json: 'tag_definition_ids' must be a non-empty dict.")
 
-    # Validate devices list.
-    devices = config["devices"]
-    if not isinstance(devices, list) or len(devices) == 0:
-        raise ValueError("config.json: 'devices' must be a non-empty list.")
+    # Validate buses list.
+    buses = config["buses"]
+    if not isinstance(buses, list) or len(buses) == 0:
+        raise ValueError("config.json: 'buses' must be a non-empty list.")
 
-    for i, device in enumerate(devices):
-        # Check each device has all required keys.
-        missing_dev = [k for k in _REQUIRED_DEVICE_KEYS if k not in device]
-        if missing_dev:
+    total_devices = 0
+    for b_idx, bus in enumerate(buses):
+        # Each bus must have the required top-level keys.
+        missing_bus = [k for k in _REQUIRED_BUS_KEYS if k not in bus]
+        if missing_bus:
             raise ValueError(
-                "config.json: device[{}] ({}) is missing keys: {}".format(
-                    i, device.get("name", "?"), missing_dev
+                "config.json: buses[{}] (port={}) is missing keys: {}".format(
+                    b_idx, bus.get("port", "?"), missing_bus
                 )
             )
-        # Check the vfd_model is one we know how to talk to.
-        if device["vfd_model"] not in VFD_REGISTER_MAPS:
+
+        devices = bus["devices"]
+        if not isinstance(devices, list) or len(devices) == 0:
             raise ValueError(
-                "config.json: device '{}' has unknown vfd_model '{}'. "
-                "Known models: {}".format(
-                    device["name"],
-                    device["vfd_model"],
-                    list(VFD_REGISTER_MAPS.keys()),
+                "config.json: buses[{}] (port={}) has an empty 'devices' list.".format(
+                    b_idx, bus["port"]
                 )
             )
+
+        for d_idx, device in enumerate(devices):
+            # Each device must have all required fields.
+            missing_dev = [k for k in _REQUIRED_DEVICE_KEYS if k not in device]
+            if missing_dev:
+                raise ValueError(
+                    "config.json: buses[{}].devices[{}] ({}) is missing keys: {}".format(
+                        b_idx, d_idx, device.get("name", "?"), missing_dev
+                    )
+                )
+            # The vfd_model must map to a known register spec.
+            if device["vfd_model"] not in VFD_REGISTER_MAPS:
+                raise ValueError(
+                    "config.json: device '{}' has unknown vfd_model '{}'. "
+                    "Known models: {}".format(
+                        device["name"],
+                        device["vfd_model"],
+                        list(VFD_REGISTER_MAPS.keys()),
+                    )
+                )
+
+        total_devices += len(devices)
 
     # Log non-sensitive config values so startup is auditable.
     log.info(
-        "Config loaded — api_base_url=%s  port=%s  baud=%d  poll=%ds  "
-        "%d device(s) configured",
+        "Config loaded — api_base_url=%s  poll=%ds  %d bus(es)  %d total device(s)",
         config["api_base_url"],
-        config["modbus_port"],
-        config["modbus_baudrate"],
         config["polling_interval_seconds"],
-        len(devices),
+        len(buses),
+        total_devices,
     )
-    for device in devices:
+    for b_idx, bus in enumerate(buses):
         log.info(
-            "  Device: %-8s  slave=%2d  model=%-16s  component_instance_id=%d",
-            device["name"],
-            device["slave_id"],
-            device["vfd_model"],
-            device["component_instance_id"],
+            "  Bus %d: port=%s  baud=%d  %d device(s)",
+            b_idx + 1, bus["port"], bus["baudrate"], len(bus["devices"]),
         )
+        for device in bus["devices"]:
+            log.info(
+                "    Device: %-8s  slave=%2d  model=%-16s  component_instance_id=%d",
+                device["name"],
+                device["slave_id"],
+                device["vfd_model"],
+                device["component_instance_id"],
+            )
 
     return config
 
@@ -903,48 +973,138 @@ def read_modbus(
 # COMPONENT 5b — Main polling loop
 # ---------------------------------------------------------------------------
 
+def _poll_bus(
+    bus: dict,
+    timestamp: str,
+    company_id: int,
+    tag_definition_ids: dict,
+) -> tuple[int, int, int]:
+    """Open a Modbus connection to one RS485 bus, poll all its devices, close.
+
+    Returns (machines_polled, machines_failed, total_written) for this bus.
+    Any connection or unexpected error is caught here so the caller can
+    continue with the remaining buses.
+
+    Each device's Modbus failures are already caught inside read_modbus() —
+    those return None and are counted as machine failures, not bus failures.
+    """
+    port     = bus["port"]
+    baudrate = bus["baudrate"]
+    parity   = bus.get("parity", "N")
+    stopbits = bus.get("stopbits", 1)
+    devices  = bus["devices"]
+
+    machines_polled = len(devices)
+    machines_failed = 0
+    total_written   = 0
+
+    client = ModbusSerialClient(
+        port=port,
+        baudrate=baudrate,
+        parity=parity,
+        stopbits=stopbits,
+        bytesize=8,
+        timeout=1,
+    )
+
+    if not client.connect():
+        # Serial port unavailable — USB adapter may be unplugged.
+        # Count all devices on this bus as failed and continue to the next bus.
+        log.error(
+            "Bus %s: cannot open serial port — "
+            "is the USB adapter plugged in?  Skipping all %d device(s) this cycle.",
+            port, len(devices),
+        )
+        machines_failed = len(devices)
+        return machines_polled, machines_failed, total_written
+
+    log.debug("Bus %s: Modbus connected", port)
+
+    try:
+        for device in devices:
+            dev_name     = device["name"]
+            slave_id     = device["slave_id"]
+            vfd_model    = device["vfd_model"]
+            component_id = device["component_instance_id"]
+            dev_label    = "{} / slave={}".format(dev_name, slave_id)
+
+            # read_modbus() catches Modbus-layer errors and returns None.
+            values = read_modbus(client, slave_id, vfd_model)
+
+            if values is None:
+                machines_failed += 1
+                log.warning("[%s] Skipping — no data this cycle", dev_label)
+                continue
+
+            # Write each decoded tag value to the SQLite outbox.
+            # Tags absent from tag_definition_ids have no DB entry — skip silently.
+            written = 0
+            for tag_name, value in values.items():
+                tag_def_id = tag_definition_ids.get(tag_name)
+                if tag_def_id is None:
+                    log.debug(
+                        "[%s] No tag_definition_id for '%s' — skipping",
+                        dev_label, tag_name,
+                    )
+                    continue
+
+                payload = {
+                    "timestamp":             timestamp,
+                    "component_instance_id": component_id,
+                    "tag_definition_id":     tag_def_id,
+                    "value_num":             value,
+                    "company_id":            company_id,
+                }
+                write_to_outbox(payload)
+                written += 1
+
+            total_written += written
+            log.info("[%s] %d reading(s) written to outbox", dev_label, written)
+
+    except Exception as exc:
+        # Unexpected mid-poll error on this bus (e.g. serial device dropped).
+        # Log it and return what we have — the outer loop continues with other buses.
+        log.error(
+            "Bus %s: unexpected error mid-poll — %s.  "
+            "Readings collected so far are preserved in the outbox.",
+            port, exc,
+        )
+        # We cannot know which devices hadn't been reached yet, so we don't
+        # inflate machines_failed here — the logged error is the audit trail.
+
+    finally:
+        # Always close, even if an exception occurred.
+        client.close()
+        log.debug("Bus %s: Modbus disconnected", port)
+
+    return machines_polled, machines_failed, total_written
+
+
 def run(config: dict):
-    """Poll all devices, buffer readings, and forward to the cloud.  Runs indefinitely.
+    """Poll all buses, buffer readings, and forward to the cloud.  Runs indefinitely.
 
     Each poll cycle:
-      1. Iterate over every device in config["devices"] in order.
-      2. Read Modbus registers for that device.
-      3. For each decoded register value, look up the tag_definition_id in
-         config["tag_definition_ids"].  If found, write one outbox row.
-      4. After all devices are polled, forward the outbox to the cloud API.
-      5. Sleep for polling_interval_seconds.
+      1. For each RS485 bus, open a Modbus connection and poll every device.
+         Each bus is wrapped in its own error handler so a failing bus does not
+         prevent the others from being polled.
+      2. Outbox reads from all buses are batched and forwarded to the cloud API.
+      3. A single heartbeat is posted with the accumulated poll stats.
+      4. Sleep for polling_interval_seconds.
 
     Error handling:
-      - ModbusIOException per device → skip that device, continue to next.
-      - OSError errno 5 (USB device lost) → log CRITICAL, exit for systemd restart.
-      - 5 consecutive unhandled exceptions → log CRITICAL, exit for systemd restart.
-      - Any other exception → log ERROR with traceback, sleep 30 s, resume loop.
+      - ModbusIOException per device  → skip that device, handled by read_modbus().
+      - Bus connection failure         → skip that bus, counted as all-failed.
+      - Unexpected mid-poll exception  → per-bus error; logged; other buses continue.
+      - 5 consecutive unhandled exceptions in the outer loop → exit for systemd restart.
 
     Args:
         config: Validated dict from load_config().
     """
-    poll_interval       = config["polling_interval_seconds"]
-    modbus_port         = config["modbus_port"]
-    modbus_baud         = config["modbus_baudrate"]
-    company_id          = config["company_id"]
-    api_base_url        = config["api_base_url"]
-    devices             = config["devices"]
-    tag_definition_ids  = config["tag_definition_ids"]
-    # tag_definition_ids maps tag_name → tag_definition_id (int).
-    # Tags not present in this dict are not stored (e.g. "ref_frequency").
-
-    # One ModbusSerialClient for the entire RS485 bus.
-    # All devices share the same port — they are distinguished by slave_id.
-    # parity='N', stopbits=1, bytesize=8 are the standard RS485 settings used
-    # by all three VFD models on this installation.
-    client = ModbusSerialClient(
-        port=modbus_port,
-        baudrate=modbus_baud,
-        parity="N",
-        stopbits=1,
-        bytesize=8,
-        timeout=1,
-    )
+    poll_interval      = config["polling_interval_seconds"]
+    company_id         = config["company_id"]
+    api_base_url       = config["api_base_url"]
+    buses              = config["buses"]
+    tag_definition_ids = config["tag_definition_ids"]
 
     token_manager = TokenManager(
         api_base_url=api_base_url,
@@ -952,133 +1112,63 @@ def run(config: dict):
         password=config["api_password"],
     )
 
+    total_devices = sum(len(bus["devices"]) for bus in buses)
     log.info(
-        "Gateway starting up — port=%s  baud=%d  poll=%ds  %d device(s)",
-        modbus_port, modbus_baud, poll_interval, len(devices),
+        "Gateway starting up — %d bus(es)  %d total device(s)  poll=%ds",
+        len(buses), total_devices, poll_interval,
     )
 
-    if not client.connect():
-        # Can't open the serial port — USB adapter may not be attached.
-        # Exit so systemd restarts after RestartSec (10 s in gateway.service).
-        log.error(
-            "Cannot open Modbus port %s — "
-            "is the Waveshare USB adapter plugged in?",
-            modbus_port,
-        )
-        raise SystemExit(1)
-
-    log.info("Modbus connected on %s", modbus_port)
-
-    # Consecutive-failure counter for the top-level exception handler.
-    # Counts unhandled exceptions in a row; reset after any successful cycle.
-    # At 5, we exit so systemd restarts the process in a clean state.
+    # Consecutive-failure counter for truly unexpected top-level exceptions.
+    # Device- and bus-level failures are handled inside _poll_bus() and do not
+    # increment this counter.  At 5, we exit so systemd restarts cleanly.
     _MAX_CONSECUTIVE_FAILURES = 5
     _consecutive_failures = 0
 
     while True:
         try:
             poll_cycle_start = time.time()
-            timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
-            total_written  = 0   # outbox writes this cycle across all devices
-            machines_failed = 0  # devices that returned None from read_modbus
+            timestamp        = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+            total_written    = 0
+            machines_polled  = 0
+            machines_failed  = 0
 
-            # ── Step 1: Poll each device ─────────────────────────────────
-            for device in devices:
-                dev_name    = device["name"]
-                slave_id    = device["slave_id"]
-                vfd_model   = device["vfd_model"]
-                component_id = device["component_instance_id"]
-
-                # Short label used in log messages: "Jet 33 / slave=1"
-                dev_label = "{} / slave={}".format(dev_name, slave_id)
-
-                # Read registers from this device.
-                # Returns None on any Modbus error — skip this device for this cycle.
-                values = read_modbus(client, slave_id, vfd_model)
-
-                if values is None:
-                    # Modbus failure is already logged inside read_modbus().
-                    # We do NOT count this as a consecutive failure — it is a
-                    # handled condition, not an unhandled exception.
-                    machines_failed += 1
-                    log.warning("[%s] Skipping — no data this cycle", dev_label)
-                    continue
-
-                # ── Step 2: Write each tag value to the outbox ───────────
-                # For each decoded register, look up its tag_definition_id.
-                # Tags absent from tag_definition_ids are silently skipped
-                # (e.g. "ref_frequency" on INVT, "torque" on Yaskawa).
-                written = 0
-                for tag_name, value in values.items():
-                    tag_def_id = tag_definition_ids.get(tag_name)
-                    if tag_def_id is None:
-                        # This tag exists in the register map but has no
-                        # corresponding DB entry — skip silently.
-                        log.debug(
-                            "[%s] No tag_definition_id for '%s' — skipping",
-                            dev_label, tag_name,
-                        )
-                        continue
-
-                    # Note: the API uses value_num for numeric readings.
-                    # The DataCreate schema has value_num (float) and
-                    # value_text (str) — all VFD readings are numeric.
-                    payload = {
-                        "timestamp":             timestamp,
-                        "component_instance_id": component_id,
-                        "tag_definition_id":     tag_def_id,
-                        "value_num":             value,
-                        "company_id":            company_id,
-                    }
-                    write_to_outbox(payload)
-                    written += 1
-
-                total_written += written
-                log.info(
-                    "[%s] %d reading(s) written to outbox",
-                    dev_label, written,
+            # ── Step 1: Poll each bus independently ─────────────────────
+            for bus in buses:
+                polled, failed, written = _poll_bus(
+                    bus, timestamp, company_id, tag_definition_ids
                 )
+                machines_polled += polled
+                machines_failed += failed
+                total_written   += written
 
-            # ── Step 3: Forward outbox to cloud API ──────────────────────
+            # ── Step 2: Forward outbox to cloud API ─────────────────────
             log.info(
-                "Poll cycle complete — %d total reading(s) from %d device(s)",
-                total_written, len(devices),
+                "Poll cycle complete — %d reading(s) across %d bus(es)  "
+                "(%d/%d devices ok)",
+                total_written, len(buses),
+                machines_polled - machines_failed, machines_polled,
             )
             forward_outbox(token_manager, api_base_url)
 
-            # ── Step 4: Post heartbeat ────────────────────────────────────
-            # Call AFTER forward_outbox — outbox flushing is more important.
-            # post_heartbeat() is fire-and-forget; failures are logged, not raised.
+            # ── Step 3: Post heartbeat ───────────────────────────────────
+            # Fire-and-forget — failures are logged but never raised.
             poll_duration = time.time() - poll_cycle_start
             post_heartbeat(
                 token_manager     = token_manager,
                 api_base_url      = api_base_url,
                 poll_duration_sec = poll_duration,
-                machines_polled   = len(devices),
+                machines_polled   = machines_polled,
                 machines_failed   = machines_failed,
             )
 
-            # Reaching here means no unhandled exception occurred this cycle.
+            # A complete cycle resets the consecutive-failure counter.
             _consecutive_failures = 0
 
-        except Exception as exc:
+        except Exception:
             _consecutive_failures += 1
 
-            # ── USB serial device lost (errno 5: Input/output error) ─────
-            # The device node (/dev/ttyUSBx) was dropped by the kernel —
-            # the file handle is dead.  Looping would spin forever on the
-            # same broken handle.  Exit immediately so systemd restarts the
-            # process (Restart=always, RestartSec=10) with a fresh handle.
-            if isinstance(exc, OSError) and exc.errno == 5:
-                log.critical(
-                    "Serial device lost (errno 5: I/O error) — "
-                    "exiting for systemd restart"
-                )
-                raise SystemExit(1)
-
-            # ── Consecutive-failure threshold ─────────────────────────────
-            # Five unhandled exceptions in a row without any successful cycle
-            # means the process is stuck.  Exit so systemd can restart cleanly.
+            # Five unhandled exceptions in a row without a successful cycle means
+            # the process is in a broken state.  Exit so systemd restarts cleanly.
             if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
                 log.critical(
                     "%d consecutive unhandled exceptions — "
@@ -1088,8 +1178,7 @@ def run(config: dict):
                 )
                 raise SystemExit(1)
 
-            # ── Recoverable unexpected error ──────────────────────────────
-            # Log the full traceback for diagnosis, sleep 30 s, then resume.
+            # Recoverable unexpected error — log the full traceback, sleep 30 s.
             log.error(
                 "Unexpected error in poll loop "
                 "(failure %d/%d before forced restart):\n%s",
