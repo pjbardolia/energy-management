@@ -107,7 +107,7 @@ _INVT_CHF100A_SPEC = {
         ("output_voltage", 3, 1),    # Output voltage    raw   → V
         ("current",        4, 10),   # Output current    / 10  → A
         ("rpm",            5, 1),    # Motor speed       raw   → RPM
-        ("power",          6, 10),   # Output power      / 10  → kW
+        ("power",          6, 100),  # Output power      / 100 → kW  (verified 2026-07-16: raw×0.01=kW)
         ("torque",         7, 10),   # Output torque     / 10  → %
     ],
 }
