@@ -44,6 +44,17 @@ const MACHINES = [
   { id:14, name:"Jet 27", cid:15, model:"INVT CHF100A",   slave:12 },
   { id:15, name:"Jet 28", cid:16, model:"INVT CHF100A",   slave:13 },
   { id:16, name:"Jet 29", cid:17, model:"INVT CHF100A",   slave:14 },
+  { id:17, name:"Jet 31", cid:18, model:"Delta CP2000",  slave:1  },
+  { id:18, name:"Jet 30", cid:19, model:"Delta CP2000",  slave:2  },
+  { id:19, name:"Jet 15", cid:20, model:"INVT CHF100A",  slave:3  },
+  { id:20, name:"Jet 05", cid:21, model:"INVT CHF100A",  slave:4  },
+  { id:21, name:"Jet 06", cid:22, model:"INVT CHF100A",  slave:5  },
+  { id:22, name:"Jet 07", cid:23, model:"INVT CHF100A",  slave:6  },
+  { id:23, name:"Jet 08", cid:24, model:"INVT CHF100A",  slave:7  },
+  { id:24, name:"Jet 22", cid:25, model:"INVT CHF100A",  slave:8  },
+  { id:25, name:"Jet 23", cid:26, model:"Yaskawa F7",    slave:9  },
+  { id:26, name:"Jet 24", cid:27, model:"Yaskawa F7",    slave:10 },
+  { id:27, name:"Jet 25", cid:28, model:"Yaskawa F7",    slave:11 },
 ];
 
 // Keyed by machine.id — used to recover model/slave_id after live API merges.
