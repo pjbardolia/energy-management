@@ -13,7 +13,7 @@ hardware specs belong in code, deployment config belongs in config.json):
   - YASKAWA_A1000  : 5 registers at 0x0023 + extra read at 0x0046 (dc_voltage)
   - YASKAWA_V1000  : same spec as A1000
   - YASKAWA_F7     : same spec as A1000
-  - DELTA_CP2000   : 4 registers at 0x2103 + extra read at 0x210B (torque/rpm/power)
+  - DELTA_CP2000   : 5 registers at 0x2200 (current/freq/dc_voltage/output_voltage)
   - ELECTROSIL_FX438 : 1 register at 0x0000 (process temperature)
 
 Bus configuration (port, baudrate, devices list) lives in config.json under the
@@ -171,27 +171,16 @@ _YASKAWA_SPEC = {
 # NOTE: divisor for power is 1000 (NOT 100 like INVT CHF100A) — the CP2000
 # encodes kW in the format X.XXX, so raw=1234 → 1.234 kW.
 _DELTA_CP2000_SPEC = {
-    "address": 0x2103,   # Primary block: freq, current, dc_bus, output_v
-    "count":   4,
+    "address": 0x2200,   # Monitor block — confirmed accessible 2026-07-17
+    "count":   5,        # 0x2200=current, 0x2201=counter(skip), 0x2202=freq, 0x2203=dc_bus, 0x2204=output_v
     "registers": [
-        ("frequency",      0, 100),  # Output frequency   / 100 → Hz
-        ("current",        1,  10),  # Output current     / 10  → A
-        ("dc_voltage",     2,  10),  # DC bus voltage     / 10  → V
-        ("output_voltage", 3,  10),  # Output voltage     / 10  → V
+        ("current",        0,  10),  # 0x2200 Output current    / 10  → A
+        # index 1 = 0x2201 counter — skipped
+        ("frequency",      2, 100),  # 0x2202 Output frequency  / 100 → Hz
+        ("dc_voltage",     3,  10),  # 0x2203 DC bus voltage    / 10  → V
+        ("output_voltage", 4,  10),  # 0x2204 Output voltage    / 10  → V
     ],
-    "extra_reads": [
-        {
-            "address": 0x210B,   # Second block: torque, rpm, reserved×2, power
-            "count":   5,        # Read 5 registers; indices 2 and 3 are reserved
-            "registers": [
-                ("torque", 0,  10),   # Output torque  / 10   → %
-                ("rpm",    1,   1),   # Motor speed    raw    → rpm
-                # index 2 = 0x210D Reserved — not listed, never accessed
-                # index 3 = 0x210E Reserved — not listed, never accessed
-                ("power",  4, 1000),  # Output power   / 1000 → kW
-            ],
-        },
-    ],
+    # extra_reads removed — 0x210B block not accessible, investigate later
 }
 
 # Electrosil Fx-438 PID temperature controller (dyebath temperature sensor).
