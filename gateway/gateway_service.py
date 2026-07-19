@@ -188,10 +188,10 @@ _DELTA_CP2000_SPEC = {
 # Source: Electrosil Fx-438 manual + standard PID controller convention.
 # Raw value / 10 = °C  (e.g. 260 → 26.0 °C).
 _ELECTROSIL_FX438_SPEC = {
-    "address": 0x0000,
+    "address": 138,       # PV register (decimal 138 = 0x008A per official Modbus address doc)
     "count":   1,
     "registers": [
-        ("temperature", 0, 10),  # Process value / 10 → °C
+        ("temperature", 0, 1),   # Process value raw → °C (no scaling, verified 2026-07-19)
     ],
 }
 
