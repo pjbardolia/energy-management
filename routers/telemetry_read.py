@@ -23,9 +23,11 @@
 #
 # Write endpoint (POST /data) stays in data_router.py — not touched here.
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, date as date_type
+import io
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -453,3 +455,205 @@ def get_temperature_history(
         {"value": float(r["value_num"]), "timestamp": r["timestamp"].isoformat()}
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# GET /sensors/temperature/log, /sensors/temperature/log/pdf
+#
+# 5-minute average temperature log for one operational day (09:00 IST ->
+# 09:00 IST next day), plus a downloadable PDF rendering of the same data.
+# Same hardcoded sensor identity as /current and /history above — single
+# sensor, single tenant today; multi-sensor support is a future enhancement.
+# ---------------------------------------------------------------------------
+
+_IST_OFFSET = timedelta(hours=5, minutes=30)
+
+
+def _op_day_bounds_utc(op_date: date_type) -> tuple[datetime, datetime]:
+    """Operational day: 09:00 IST -> 09:00 IST next day, as UTC bounds."""
+    start_ist = datetime(op_date.year, op_date.month, op_date.day, 9, 0, 0)
+    start_utc = start_ist.replace(tzinfo=timezone.utc) - _IST_OFFSET
+    end_utc   = start_utc + timedelta(hours=24)
+    return start_utc, end_utc
+
+
+def _fetch_temperature_log_rows(db: Session, company_id: int, op_date: date_type):
+    """Shared query — 5-minute average temperature buckets for one operational day."""
+    start_utc, end_utc = _op_day_bounds_utc(op_date)
+
+    sql = text("""
+        SELECT
+            time_bucket('5 minutes', timestamp) AS bucket,
+            AVG(value_num) AS avg_temp
+        FROM telemetry_data
+        WHERE tag_definition_id     = :tag_id
+          AND component_instance_id = :component_id
+          AND company_id            = :company_id
+          AND timestamp             >= :start_utc
+          AND timestamp             <  :end_utc
+        GROUP BY bucket
+        ORDER BY bucket
+    """)
+
+    return db.execute(sql, {
+        "tag_id":       _TEMPERATURE_TAG_ID,
+        "component_id": _TEMPERATURE_COMPONENT_ID,
+        "company_id":   company_id,
+        "start_utc":    start_utc,
+        "end_utc":      end_utc,
+    }).mappings().fetchall()
+
+
+@router.get("/sensors/temperature/log")
+def get_temperature_log(
+    date: str = Query(..., description="Operational day start date YYYY-MM-DD (IST)"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
+):
+    """
+    5-minute average temperature readings for one operational day
+    (09:00 IST -> 09:00 IST next day).
+    """
+    company_id = current_user["company_id"]
+
+    try:
+        op_date = date_type.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD.")
+
+    rows = _fetch_temperature_log_rows(db, company_id, op_date)
+
+    return {
+        "date": date,
+        "shift_start_ist": "09:00",
+        "shift_end_ist": "09:00 (+1 day)",
+        "readings": [
+            {
+                "time": (r["bucket"] + _IST_OFFSET).strftime("%I:%M %p"),
+                "timestamp": r["bucket"].isoformat(),
+                "avg_temp": round(float(r["avg_temp"]), 1),
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/sensors/temperature/log/pdf")
+def get_temperature_log_pdf(
+    date: str = Query(..., description="Operational day start date YYYY-MM-DD (IST)"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
+):
+    """
+    Same data as /sensors/temperature/log, rendered as a downloadable PDF report.
+    """
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+
+    company_id = current_user["company_id"]
+
+    try:
+        op_date = date_type.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD.")
+
+    rows = _fetch_temperature_log_rows(db, company_id, op_date)
+
+    if not rows:
+        raise HTTPException(404, "No temperature data for this date.")
+
+    # --- Build PDF in memory ---
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=letter,
+        topMargin=0.6*inch, bottomMargin=0.6*inch,
+        leftMargin=0.7*inch, rightMargin=0.7*inch,
+    )
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        'MevionTitle', parent=styles['Title'],
+        textColor=colors.HexColor('#dc2626'), fontSize=18,
+    )
+    subtitle_style = ParagraphStyle(
+        'MevionSubtitle', parent=styles['Normal'],
+        textColor=colors.HexColor('#6b7280'), fontSize=10,
+    )
+
+    story = []
+    story.append(Paragraph("Mevion — Dyebath Temperature Log", title_style))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(
+        f"Jet 27 · Electrosil Fx-438 · Operational day {op_date.strftime('%d %b %Y')} "
+        f"(09:00 to 09:00 next day, IST)",
+        subtitle_style
+    ))
+    story.append(Spacer(1, 16))
+
+    # Summary stats
+    temps = [float(r["avg_temp"]) for r in rows]
+    summary_data = [
+        ["Readings", "Avg", "Min", "Max"],
+        [str(len(temps)), f"{sum(temps)/len(temps):.1f}°C",
+         f"{min(temps):.1f}°C", f"{max(temps):.1f}°C"],
+    ]
+    summary_table = Table(summary_data, colWidths=[1.4*inch]*4)
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#f3f4f6')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.HexColor('#374151')),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTNAME', (0,1), (-1,1), 'Helvetica'),
+        ('FONTSIZE', (0,0), (-1,-1), 10),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#e5e7eb')),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 20))
+
+    # Main log table — two columns side by side to fit more rows per page
+    # (5-min intervals over 24h = up to 288 rows; single column would be very long)
+    table_data = [["Time", "Avg °C", "", "Time", "Avg °C"]]
+    half = (len(rows) + 1) // 2
+    left_rows = rows[:half]
+    right_rows = rows[half:]
+
+    for i in range(half):
+        left_time = (left_rows[i]["bucket"] + _IST_OFFSET).strftime("%I:%M %p")
+        left_temp = f"{float(left_rows[i]['avg_temp']):.1f}"
+        if i < len(right_rows):
+            right_time = (right_rows[i]["bucket"] + _IST_OFFSET).strftime("%I:%M %p")
+            right_temp = f"{float(right_rows[i]['avg_temp']):.1f}"
+        else:
+            right_time, right_temp = "", ""
+        table_data.append([left_time, left_temp, "", right_time, right_temp])
+
+    log_table = Table(table_data, colWidths=[1.1*inch, 0.8*inch, 0.3*inch, 1.1*inch, 0.8*inch])
+    log_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#dc2626')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,-1), 8),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('GRID', (0,0), (1,-1), 0.5, colors.HexColor('#e5e7eb')),
+        ('GRID', (3,0), (4,-1), 0.5, colors.HexColor('#e5e7eb')),
+        ('ROWBACKGROUNDS', (0,1), (1,-1), [colors.white, colors.HexColor('#f9fafb')]),
+        ('ROWBACKGROUNDS', (3,1), (4,-1), [colors.white, colors.HexColor('#f9fafb')]),
+        ('TOPPADDING', (0,0), (-1,-1), 3),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+    ]))
+    story.append(log_table)
+
+    doc.build(story)
+    buffer.seek(0)
+
+    filename = f"mevion-jet27-temperature-{date}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
