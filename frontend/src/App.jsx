@@ -254,9 +254,17 @@ function RuntimeBar({ runtime }) {
       <div style={{ height: 4, background: '#374151', borderRadius: 2, overflow: 'hidden', marginBottom: 4 }}>
         <div style={{ height: '100%', width: `${pct}%`, background: C.red, borderRadius: 2, transition: 'width 0.5s ease' }} />
       </div>
-      <div style={{ fontSize: 11, color: C.muted, display: 'flex', justifyContent: 'space-between' }}>
-        <span>{shift}: {label} running</span>
-        <span>{pct.toFixed(0)}%</span>
+      <div style={{
+        fontSize: 13, color: '#1f2937',
+        display: 'flex', justifyContent: 'space-between',
+        alignItems: 'baseline',
+      }}>
+        <span style={{ fontWeight: 700 }}>
+          {shift}: <span style={{ fontSize: 15 }}>{label}</span> running
+        </span>
+        <span style={{ fontWeight: 800, fontSize: 16, color: C.red }}>
+          {pct.toFixed(0)}%
+        </span>
       </div>
     </div>
   );
@@ -1124,13 +1132,15 @@ const AnalyticsPage = ({ token, onLogout }) => {
       .finally(() => setLoading(false));
   }, [view, fromDate, toDate, selectedMachine, token, onLogout, analyticsTab]);
 
-  // Dark theme tokens (Analytics panel only — does not affect the rest of the app).
-  const dk = {
-    bg:     '#111827',
-    card:   '#1f2937',
-    text:   '#f9fafb',
+  // Light theme tokens (Analytics panel only — matches TemperaturePage's white theme).
+  // bg is transparent so the panel inherits the page's light-gray background (C.bg),
+  // letting the white bordered cards stand out — same visual hierarchy as TemperaturePage.
+  const lt = {
+    bg:     'transparent',
+    card:   '#ffffff',
+    text:   '#1f2937',
     muted:  '#6b7280',
-    border: '#374151',
+    border: '#e5e7eb',
   };
 
   const PRESETS = ['7d', '30d', '90d', '365d', 'custom'];
@@ -1140,7 +1150,7 @@ const AnalyticsPage = ({ token, onLogout }) => {
   const machineChartData= machineData ? getMachineChartData(machineData.daily_rows) : [];
 
   return (
-    <div style={{ background: dk.bg, borderRadius: 12, padding: '20px 24px', minHeight: 480, color: dk.text, fontFamily: 'inherit' }}>
+    <div style={{ background: lt.bg, borderRadius: 12, padding: '20px 24px', minHeight: 480, color: lt.text, fontFamily: 'inherit' }}>
 
       {/* Runtime / Energy tab toggle */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 16 }}>
@@ -1148,23 +1158,23 @@ const AnalyticsPage = ({ token, onLogout }) => {
           <button key={val} onClick={() => setAnalyticsTab(val)} style={{
             padding: '6px 16px', borderRadius: 6, fontSize: 14, fontFamily: 'inherit',
             background: analyticsTab === val ? C.red : 'transparent',
-            color:      analyticsTab === val ? '#fff' : dk.muted,
-            border:     `1px solid ${analyticsTab === val ? C.red : dk.border}`,
+            color:      analyticsTab === val ? '#fff' : lt.muted,
+            border:     `1px solid ${analyticsTab === val ? C.red : lt.border}`,
             cursor: 'pointer', fontWeight: analyticsTab === val ? 600 : 400,
           }}>{label}</button>
         ))}
       </div>
 
       {/* Controls bar */}
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center', marginBottom: 20, paddingBottom: 16, borderBottom: `1px solid ${dk.border}` }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center', marginBottom: 20, paddingBottom: 16, borderBottom: `1px solid ${lt.border}` }}>
 
         {/* View toggle */}
         <div style={{ display: 'flex', gap: 4 }}>
           {[['fleet','All machines'],['machine','One machine']].map(([v, label]) => (
             <button key={v} onClick={() => setView(v)} style={{
-              background: view === v ? C.red : dk.card,
-              color:  view === v ? '#fff' : dk.muted,
-              border: `1px solid ${view === v ? C.red : dk.border}`,
+              background: view === v ? C.red : lt.card,
+              color:  view === v ? '#fff' : lt.muted,
+              border: `1px solid ${view === v ? C.red : lt.border}`,
               borderRadius: 6, padding: '5px 14px', fontSize: 13,
               fontWeight: view === v ? 600 : 400, cursor: 'pointer', fontFamily: 'inherit',
             }}>{label}</button>
@@ -1175,9 +1185,9 @@ const AnalyticsPage = ({ token, onLogout }) => {
         <div style={{ display: 'flex', gap: 4 }}>
           {PRESETS.map(p => (
             <button key={p} onClick={() => applyPreset(p)} style={{
-              background: preset === p ? dk.border : 'transparent',
-              color: preset === p ? dk.text : dk.muted,
-              border: `1px solid ${dk.border}`, borderRadius: 6,
+              background: preset === p ? lt.border : 'transparent',
+              color: preset === p ? lt.text : lt.muted,
+              border: `1px solid ${lt.border}`, borderRadius: 6,
               padding: '4px 10px', fontSize: 12, cursor: 'pointer',
               fontWeight: preset === p ? 600 : 400, fontFamily: 'inherit',
             }}>{p === 'custom' ? 'Custom' : p}</button>
@@ -1188,11 +1198,11 @@ const AnalyticsPage = ({ token, onLogout }) => {
         {preset === 'custom' && (
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
             <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
-              style={{ background: dk.card, color: dk.text, border: `1px solid ${dk.border}`, borderRadius: 6, padding: '4px 8px', fontSize: 12 }}
+              style={{ background: lt.card, color: lt.text, border: `1px solid ${lt.border}`, borderRadius: 6, padding: '4px 8px', fontSize: 12 }}
             />
-            <span style={{ color: dk.muted, fontSize: 12 }}>to</span>
+            <span style={{ color: lt.muted, fontSize: 12 }}>to</span>
             <input type="date" value={toDate} onChange={e => setToDate(e.target.value)}
-              style={{ background: dk.card, color: dk.text, border: `1px solid ${dk.border}`, borderRadius: 6, padding: '4px 8px', fontSize: 12 }}
+              style={{ background: lt.card, color: lt.text, border: `1px solid ${lt.border}`, borderRadius: 6, padding: '4px 8px', fontSize: 12 }}
             />
           </div>
         )}
@@ -1202,7 +1212,7 @@ const AnalyticsPage = ({ token, onLogout }) => {
           <select
             value={selectedMachine.id}
             onChange={e => setSelectedMachine(MACHINES.find(m => m.id === parseInt(e.target.value)))}
-            style={{ background: dk.card, color: dk.text, border: `1px solid ${dk.border}`, borderRadius: 6, padding: '4px 10px', fontSize: 13 }}
+            style={{ background: lt.card, color: lt.text, border: `1px solid ${lt.border}`, borderRadius: 6, padding: '4px 10px', fontSize: 13 }}
           >
             {MACHINES.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
           </select>
@@ -1210,11 +1220,11 @@ const AnalyticsPage = ({ token, onLogout }) => {
       </div>
 
       {loading && (
-        <div style={{ textAlign: 'center', padding: 48, color: dk.muted }}>Loading…</div>
+        <div style={{ textAlign: 'center', padding: 48, color: lt.muted }}>Loading…</div>
       )}
 
       {error && (
-        <div style={{ color: '#f87171', background: '#450a0a', borderRadius: 8, padding: '10px 16px', marginBottom: 16 }}>
+        <div style={{ color: '#dc2626', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, padding: '10px 16px', marginBottom: 16 }}>
           ⚠ {error}
         </div>
       )}
@@ -1223,30 +1233,30 @@ const AnalyticsPage = ({ token, onLogout }) => {
       {analyticsTab === 'runtime' && view === 'fleet' && rangeData && !loading && (
         <>
           {/* Stacked bar chart */}
-          <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${dk.border}` }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: dk.text, marginBottom: 4 }}>
+          <div style={{ background: lt.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${lt.border}` }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: lt.text, marginBottom: 4 }}>
               Daily runtime — all machines
             </div>
-            <div style={{ fontSize: 11, color: dk.muted, marginBottom: 16 }}>
+            <div style={{ fontSize: 11, color: lt.muted, marginBottom: 16 }}>
               {fromDate} → {toDate} · Hours per day · top 8 machines by total runtime
             </div>
             {chartData.length === 0 ? (
-              <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
+              <div style={{ color: lt.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
             ) : (
               <ResponsiveContainer width="100%" height={320}>
                 <LineChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
                   <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
                     tickFormatter={d => d.slice(5)} />
                   <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
                     tickFormatter={v => `${v}h`} />
                   <Tooltip
-                    contentStyle={{ background: '#1f2937', border: '1px solid #374151',
+                    contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
                       borderRadius: 8, fontSize: 12 }}
                     formatter={(val, name) => [`${val}h`, name]}
                     labelFormatter={l => `Op. day: ${l}`}
                   />
-                  <Legend wrapperStyle={{ fontSize: 11, color: '#9ca3af' }} />
+                  <Legend wrapperStyle={{ fontSize: 11, color: '#6b7280' }} />
                   {topKeys.map((key, i) => (
                     <Line
                       key={key}
@@ -1264,11 +1274,11 @@ const AnalyticsPage = ({ token, onLogout }) => {
           </div>
 
           {/* Summary table */}
-          <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', border: `1px solid ${dk.border}`, overflowX: 'auto' }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: dk.text, marginBottom: 16 }}>Machine summary</div>
+          <div style={{ background: lt.card, borderRadius: 12, padding: '20px 24px', border: `1px solid ${lt.border}`, overflowX: 'auto' }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: lt.text, marginBottom: 16 }}>Machine summary</div>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
               <thead>
-                <tr style={{ color: dk.muted, borderBottom: `1px solid ${dk.border}` }}>
+                <tr style={{ color: lt.muted, borderBottom: `1px solid ${lt.border}` }}>
                   {['Machine', 'Total runtime', 'Utilisation', 'Avg / day', 'Best day', 'Days w/ data'].map(h => (
                     <th key={h} style={{ textAlign: 'left', padding: '6px 10px', fontWeight: 600 }}>{h}</th>
                   ))}
@@ -1276,17 +1286,17 @@ const AnalyticsPage = ({ token, onLogout }) => {
               </thead>
               <tbody>
                 {rangeData.summaries.map(s => (
-                  <tr key={s.machine_id} style={{ borderBottom: `1px solid ${dk.border}`, color: dk.text }}>
+                  <tr key={s.machine_id} style={{ borderBottom: `1px solid ${lt.border}`, color: lt.text }}>
                     <td style={{ padding: '8px 10px', fontWeight: 600 }}>{s.machine_name}</td>
                     <td style={{ padding: '8px 10px' }}>{fmtMinutes(s.total_runtime_minutes)}</td>
                     <td style={{ padding: '8px 10px' }}>
-                      <span style={{ color: s.utilisation_pct >= 70 ? '#4ade80' : s.utilisation_pct >= 40 ? '#fbbf24' : '#f87171' }}>
+                      <span style={{ color: s.utilisation_pct >= 70 ? '#16a34a' : s.utilisation_pct >= 40 ? '#d97706' : '#dc2626' }}>
                         {s.utilisation_pct.toFixed(1)}%
                       </span>
                     </td>
                     <td style={{ padding: '8px 10px' }}>{fmtMinutes(s.avg_runtime_per_day_minutes)}</td>
                     <td style={{ padding: '8px 10px' }}>{fmtMinutes(s.best_day_runtime_minutes)}</td>
-                    <td style={{ padding: '8px 10px', color: dk.muted }}>{s.days_with_data}</td>
+                    <td style={{ padding: '8px 10px', color: lt.muted }}>{s.days_with_data}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1299,25 +1309,25 @@ const AnalyticsPage = ({ token, onLogout }) => {
       {analyticsTab === 'runtime' && view === 'machine' && machineData && !loading && (
         <>
           {/* Daily runtime bar chart for one machine */}
-          <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${dk.border}` }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: dk.text, marginBottom: 4 }}>
+          <div style={{ background: lt.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${lt.border}` }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: lt.text, marginBottom: 4 }}>
               {machineData.machine_name} — daily runtime
             </div>
-            <div style={{ fontSize: 11, color: dk.muted, marginBottom: 16 }}>
+            <div style={{ fontSize: 11, color: lt.muted, marginBottom: 16 }}>
               {fromDate} → {toDate} · Hours running per operational day (max 24 h)
             </div>
             {machineChartData.length === 0 ? (
-              <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
+              <div style={{ color: lt.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
             ) : (
               <ResponsiveContainer width="100%" height={280}>
                 <LineChart data={machineChartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
                   <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
                     tickFormatter={d => d.slice(5)} />
                   <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
                     tickFormatter={v => `${v}h`} domain={[0, 'auto']} />
                   <Tooltip
-                    contentStyle={{ background: '#1f2937', border: '1px solid #374151',
+                    contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
                       borderRadius: 8, fontSize: 12 }}
                     formatter={val => [`${val}h`, 'Runtime']}
                     labelFormatter={l => `Op. day: ${l}`}
@@ -1348,11 +1358,11 @@ const AnalyticsPage = ({ token, onLogout }) => {
                   { label: 'Worst day',      val: fmtMinutes(s.worst_day_runtime_minutes)     },
                   { label: 'Days with data', val: `${s.days_with_data}`                       },
                 ].map(card => (
-                  <div key={card.label} style={{ background: dk.card, borderRadius: 10, padding: '14px 16px', border: `1px solid ${dk.border}` }}>
-                    <div style={{ fontSize: 10, color: dk.muted, marginBottom: 5, fontWeight: 500, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  <div key={card.label} style={{ background: lt.card, borderRadius: 10, padding: '14px 16px', border: `1px solid ${lt.border}` }}>
+                    <div style={{ fontSize: 10, color: lt.muted, marginBottom: 5, fontWeight: 500, textTransform: 'uppercase', letterSpacing: 0.5 }}>
                       {card.label}
                     </div>
-                    <div style={{ fontSize: 20, fontWeight: 800, color: dk.text, fontVariantNumeric: 'tabular-nums' }}>
+                    <div style={{ fontSize: 20, fontWeight: 800, color: lt.text, fontVariantNumeric: 'tabular-nums' }}>
                       {card.val}
                     </div>
                   </div>
@@ -1385,31 +1395,31 @@ const AnalyticsPage = ({ token, onLogout }) => {
         return (
           <>
             {/* Stacked kWh bar chart */}
-            <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${dk.border}` }}>
-              <div style={{ fontSize: 14, fontWeight: 700, color: dk.text, marginBottom: 4 }}>
+            <div style={{ background: lt.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${lt.border}` }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: lt.text, marginBottom: 4 }}>
                 Energy consumption (kWh) — top 8 machines
               </div>
-              <div style={{ fontSize: 11, color: dk.muted, marginBottom: 16 }}>
+              <div style={{ fontSize: 11, color: lt.muted, marginBottom: 16 }}>
                 {fromDate} → {toDate} · kWh per operational day · tariff ₹{energyRangeData.tariff_per_kwh_inr}/kWh
               </div>
               {energyChartData.length === 0 ? (
-                <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
+                <div style={{ color: lt.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
               ) : (
                 <ResponsiveContainer width="100%" height={320}>
                   <LineChart data={energyChartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
                     <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
                       tickFormatter={d => d.slice(5)} />
                     <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
                       tickFormatter={v => `${v}kWh`} />
                     <Tooltip
-                      contentStyle={{ background: '#1f2937', border: '1px solid #374151',
+                      contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
                         borderRadius: 8, fontSize: 12 }}
                       formatter={(val, name) => [`${val} kWh`, `Jet ${name.replace('J', '')}`]}
                       labelFormatter={l => `Op. day: ${l}`}
                     />
                     <Legend formatter={name => `Jet ${name.replace('J', '')}`}
-                      wrapperStyle={{ fontSize: 11, color: '#9ca3af' }} />
+                      wrapperStyle={{ fontSize: 11, color: '#6b7280' }} />
                     {machineKeys.map((key, i) => (
                       <Line
                         key={key}
@@ -1427,34 +1437,34 @@ const AnalyticsPage = ({ token, onLogout }) => {
             </div>
 
             {/* Cost summary table */}
-            <div style={{ background: dk.card, borderRadius: 12, overflow: 'hidden', border: `1px solid ${dk.border}` }}>
+            <div style={{ background: lt.card, borderRadius: 12, overflow: 'hidden', border: `1px solid ${lt.border}` }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                 <thead>
-                  <tr style={{ borderBottom: `1px solid ${dk.border}` }}>
+                  <tr style={{ borderBottom: `1px solid ${lt.border}` }}>
                     {['Machine', 'Total kWh', 'Total Cost (₹)', 'Avg kWh / Day', 'Peak Day'].map(h => (
                       <th key={h} style={{ padding: '10px 16px', textAlign: 'left',
-                        color: dk.muted, fontWeight: 600, fontSize: 12 }}>{h}</th>
+                        color: lt.muted, fontWeight: 600, fontSize: 12 }}>{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
                   {energyRangeData.summaries.map((s, i) => (
-                    <tr key={s.machine_id} style={{ borderBottom: `1px solid ${dk.border}`,
-                      background: i % 2 === 0 ? 'transparent' : '#0d1117' }}>
-                      <td style={{ padding: '10px 16px', color: dk.text, fontWeight: 600 }}>{s.machine_name}</td>
-                      <td style={{ padding: '10px 16px', color: dk.text }}>{s.total_kwh.toFixed(1)}</td>
-                      <td style={{ padding: '10px 16px', color: '#22c55e', fontWeight: 600 }}>
+                    <tr key={s.machine_id} style={{ borderBottom: `1px solid ${lt.border}`,
+                      background: i % 2 === 0 ? 'transparent' : '#f9fafb' }}>
+                      <td style={{ padding: '10px 16px', color: lt.text, fontWeight: 600 }}>{s.machine_name}</td>
+                      <td style={{ padding: '10px 16px', color: lt.text }}>{s.total_kwh.toFixed(1)}</td>
+                      <td style={{ padding: '10px 16px', color: '#16a34a', fontWeight: 600 }}>
                         ₹{s.total_cost_inr.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
                       </td>
-                      <td style={{ padding: '10px 16px', color: '#d1d5db' }}>{s.avg_kwh_per_day.toFixed(1)} kWh</td>
-                      <td style={{ padding: '10px 16px', color: '#f59e0b' }}>{s.peak_day_kwh.toFixed(1)} kWh</td>
+                      <td style={{ padding: '10px 16px', color: lt.muted }}>{s.avg_kwh_per_day.toFixed(1)} kWh</td>
+                      <td style={{ padding: '10px 16px', color: '#d97706' }}>{s.peak_day_kwh.toFixed(1)} kWh</td>
                     </tr>
                   ))}
                   {/* Fleet total row */}
-                  <tr style={{ borderTop: `2px solid ${dk.border}`, background: '#0d1117' }}>
-                    <td style={{ padding: '10px 16px', color: dk.text, fontWeight: 700 }}>TOTAL</td>
-                    <td style={{ padding: '10px 16px', color: dk.text, fontWeight: 700 }}>{totalKwh.toFixed(1)}</td>
-                    <td style={{ padding: '10px 16px', color: '#22c55e', fontWeight: 700 }}>
+                  <tr style={{ borderTop: `2px solid ${lt.border}`, background: '#f9fafb' }}>
+                    <td style={{ padding: '10px 16px', color: lt.text, fontWeight: 700 }}>TOTAL</td>
+                    <td style={{ padding: '10px 16px', color: lt.text, fontWeight: 700 }}>{totalKwh.toFixed(1)}</td>
+                    <td style={{ padding: '10px 16px', color: '#16a34a', fontWeight: 700 }}>
                       ₹{totalCost.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
                     </td>
                     <td colSpan={2} />
@@ -1476,25 +1486,25 @@ const AnalyticsPage = ({ token, onLogout }) => {
         }));
         return (
           <>
-            <div style={{ background: dk.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${dk.border}` }}>
-              <div style={{ fontSize: 14, fontWeight: 700, color: dk.text, marginBottom: 4 }}>
+            <div style={{ background: lt.card, borderRadius: 12, padding: '20px 24px', marginBottom: 16, border: `1px solid ${lt.border}` }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: lt.text, marginBottom: 4 }}>
                 {machineEnergyData.machine_name} — daily energy consumption
               </div>
-              <div style={{ fontSize: 11, color: dk.muted, marginBottom: 16 }}>
+              <div style={{ fontSize: 11, color: lt.muted, marginBottom: 16 }}>
                 {fromDate} → {toDate} · kWh per operational day · ₹{machineEnergyData.tariff_per_kwh_inr}/kWh
               </div>
               {energyMachineChartData.length === 0 ? (
-                <div style={{ color: dk.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
+                <div style={{ color: lt.muted, textAlign: 'center', padding: 32 }}>No data for selected range</div>
               ) : (
                 <ResponsiveContainer width="100%" height={280}>
                   <LineChart data={energyMachineChartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
                     <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
                       tickFormatter={d => d.slice(5)} />
                     <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
                       tickFormatter={v => `${v}kWh`} />
                     <Tooltip
-                      contentStyle={{ background: '#1f2937', border: '1px solid #374151',
+                      contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
                         borderRadius: 8, fontSize: 12 }}
                       formatter={val => [`${val} kWh`, 'Energy']}
                       labelFormatter={l => `Op. day: ${l}`}
@@ -1516,13 +1526,13 @@ const AnalyticsPage = ({ token, onLogout }) => {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginTop: 8 }}>
               {[
                 { label: 'Total Energy', value: `${s.total_kwh.toFixed(1)} kWh`                 },
-                { label: 'Total Cost',   value: `₹${s.total_cost_inr.toFixed(0)}`, color: '#22c55e' },
+                { label: 'Total Cost',   value: `₹${s.total_cost_inr.toFixed(0)}`, color: '#16a34a' },
                 { label: 'Avg / Op-Day', value: `${s.avg_kwh_per_day.toFixed(1)} kWh`          },
-                { label: 'Peak Day',     value: `${s.peak_day_kwh.toFixed(1)} kWh`, color: '#f59e0b' },
+                { label: 'Peak Day',     value: `${s.peak_day_kwh.toFixed(1)} kWh`, color: '#d97706' },
               ].map(card => (
-                <div key={card.label} style={{ background: dk.card, borderRadius: 10, padding: '16px 20px', border: `1px solid ${dk.border}` }}>
-                  <div style={{ fontSize: 12, color: dk.muted, marginBottom: 6 }}>{card.label}</div>
-                  <div style={{ fontSize: 22, fontWeight: 700, color: card.color || dk.text }}>
+                <div key={card.label} style={{ background: lt.card, borderRadius: 10, padding: '16px 20px', border: `1px solid ${lt.border}` }}>
+                  <div style={{ fontSize: 12, color: lt.muted, marginBottom: 6 }}>{card.label}</div>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: card.color || lt.text }}>
                     {card.value}
                   </div>
                 </div>
