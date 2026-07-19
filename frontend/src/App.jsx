@@ -1560,6 +1560,18 @@ function TemperaturePage({ token, onLogout }) {
   const [hours, setHours]       = useState(1);
   const [loading, setLoading]   = useState(true);
 
+  const [tempView, setTempView]     = useState('chart'); // 'chart' | 'table'
+  const [logDate, setLogDate]       = useState(() => {
+    // Default to current operational day: if before 9am IST, use yesterday
+    const now = new Date();
+    const istHour = (now.getUTCHours() + 5) % 24 + (now.getUTCMinutes() >= 30 ? 0.5 : 0);
+    const d = new Date(now);
+    if (istHour < 9) d.setDate(d.getDate() - 1);
+    return d.toISOString().slice(0, 10);
+  });
+  const [logData, setLogData]       = useState(null);
+  const [logLoading, setLogLoading] = useState(false);
+
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
@@ -1594,6 +1606,31 @@ function TemperaturePage({ token, onLogout }) {
 
     return () => { cancelled = true; };
   }, [token, hours]);
+
+  useEffect(() => {
+    if (!token || tempView !== 'table') return;
+    let cancelled = false;
+    setLogLoading(true);
+
+    apiFetch(`/sensors/temperature/log?date=${logDate}`, token)
+      .then(data => { if (!cancelled) { setLogData(data); setLogLoading(false); } })
+      .catch(() => { if (!cancelled) setLogLoading(false); });
+
+    return () => { cancelled = true; };
+  }, [token, tempView, logDate]);
+
+  function downloadTemperaturePdf() {
+    const url = `/api/sensors/temperature/log/pdf?date=${logDate}`;
+    // Fetch with auth header, then trigger browser download
+    fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+      .then(res => res.blob())
+      .then(blob => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `mevion-jet27-temperature-${logDate}.pdf`;
+        a.click();
+      });
+  }
 
   const chartData = history.map(h => ({
     time: new Date(h.timestamp.endsWith('Z') ? h.timestamp : h.timestamp + 'Z')
@@ -1712,44 +1749,116 @@ function TemperaturePage({ token, onLogout }) {
         ))}
       </div>
 
-      {/* History chart — area style matching reference image */}
-      <div style={{
-        background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
-        padding: 24,
-      }}>
-        <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 16 }}>
-          Temperature Trend — last {hours}h
-        </div>
-        {loading ? (
-          <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
-        ) : chartData.length === 0 ? (
-          <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
-            No temperature data for this period.
-          </div>
-        ) : (
-          <ResponsiveContainer width="100%" height={260}>
-            <AreaChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
-              <defs>
-                <linearGradient id="tempGradient" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#dc2626" stopOpacity={0.35}/>
-                  <stop offset="95%" stopColor="#dc2626" stopOpacity={0.02}/>
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
-              <XAxis dataKey="time" tick={{ fill: '#9ca3af', fontSize: 11 }} />
-              <YAxis tick={{ fill: '#9ca3af', fontSize: 11 }}
-                tickFormatter={v => `${Math.round(v)}°`} domain={['dataMin - 3', 'dataMax + 3']} />
-              <Tooltip
-                contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
-                  borderRadius: 8, fontSize: 12 }}
-                formatter={(val) => [`${val}°C`, 'Temperature']}
-              />
-              <Area type="monotone" dataKey="value" stroke="#dc2626"
-                strokeWidth={2.5} fill="url(#tempGradient)" />
-            </AreaChart>
-          </ResponsiveContainer>
-        )}
+      {/* View toggle */}
+      <div style={{ display: 'flex', gap: 4, marginTop: 16, marginBottom: 12 }}>
+        {[['chart','Chart View'],['table','Table View']].map(([val,label]) => (
+          <button key={val} onClick={() => setTempView(val)} style={{
+            padding: '6px 16px', borderRadius: 6, fontSize: 13,
+            background: tempView === val ? C.red : 'transparent',
+            color:      tempView === val ? '#fff' : '#6b7280',
+            border:     `1px solid ${tempView === val ? C.red : '#e5e7eb'}`,
+            cursor: 'pointer', fontWeight: tempView === val ? 600 : 400,
+          }}>{label}</button>
+        ))}
       </div>
+
+      {/* History chart — area style matching reference image */}
+      {tempView === 'chart' && (
+        <div style={{
+          background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
+          padding: 24,
+        }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 16 }}>
+            Temperature Trend — last {hours}h
+          </div>
+          {loading ? (
+            <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
+          ) : chartData.length === 0 ? (
+            <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
+              No temperature data for this period.
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height={260}>
+              <AreaChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                <defs>
+                  <linearGradient id="tempGradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#dc2626" stopOpacity={0.35}/>
+                    <stop offset="95%" stopColor="#dc2626" stopOpacity={0.02}/>
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
+                <XAxis dataKey="time" tick={{ fill: '#9ca3af', fontSize: 11 }} />
+                <YAxis tick={{ fill: '#9ca3af', fontSize: 11 }}
+                  tickFormatter={v => `${Math.round(v)}°`} domain={['dataMin - 3', 'dataMax + 3']} />
+                <Tooltip
+                  contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
+                    borderRadius: 8, fontSize: 12 }}
+                  formatter={(val) => [`${val}°C`, 'Temperature']}
+                />
+                <Area type="monotone" dataKey="value" stroke="#dc2626"
+                  strokeWidth={2.5} fill="url(#tempGradient)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      )}
+
+      {tempView === 'table' && (
+        <div style={{
+          background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
+          padding: 24, marginTop: 12,
+        }}>
+          <div style={{
+            display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center',
+            justifyContent: 'space-between', marginBottom: 16,
+          }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <span style={{ fontSize: 13, color: '#6b7280' }}>Operational day:</span>
+              <input type="date" value={logDate} onChange={e => setLogDate(e.target.value)}
+                style={{ padding: '5px 10px', borderRadius: 6, border: '1px solid #e5e7eb',
+                  fontSize: 13, color: '#1f2937' }} />
+            </div>
+            <button onClick={downloadTemperaturePdf} style={{
+              padding: '6px 16px', borderRadius: 6, fontSize: 13, fontWeight: 600,
+              background: C.red, color: '#fff', border: 'none', cursor: 'pointer',
+            }}>
+              Download PDF
+            </button>
+          </div>
+
+          {logLoading ? (
+            <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
+          ) : !logData?.readings?.length ? (
+            <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
+              No readings for this operational day.
+            </div>
+          ) : (
+            <div style={{ overflowX: 'auto', maxHeight: 500, overflowY: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ position: 'sticky', top: 0, background: '#fff' }}>
+                    <th style={{ padding: '8px 12px', textAlign: 'left', color: '#6b7280',
+                      borderBottom: '1px solid #e5e7eb' }}>Time</th>
+                    <th style={{ padding: '8px 12px', textAlign: 'right', color: '#6b7280',
+                      borderBottom: '1px solid #e5e7eb' }}>Avg °C</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {logData.readings.map((r, i) => (
+                    <tr key={r.timestamp} style={{
+                      background: i % 2 === 0 ? 'transparent' : '#f9fafb',
+                    }}>
+                      <td style={{ padding: '6px 12px', color: '#1f2937' }}>{r.time}</td>
+                      <td style={{ padding: '6px 12px', textAlign: 'right',
+                        color: '#dc2626', fontWeight: 600 }}>{r.avg_temp}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
