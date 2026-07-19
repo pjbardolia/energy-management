@@ -673,8 +673,8 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
               {/* Modbus-error chip: only when online but some slaves failed */}
               {gatewayStatus.is_online && gatewayStatus.machines_failed > 0 && (
                 <span style={{
-                  background:"#7c2d12", color:"#fca5a5",
-                  borderRadius:4, padding:"1px 5px", fontSize:11,
+                  background: "transparent", color: "#dc2626",
+                  borderRadius: 4, padding: "1px 5px", fontSize: 11, fontWeight: 600,
                 }}>
                   {gatewayStatus.machines_failed} Modbus error{gatewayStatus.machines_failed > 1 ? "s" : ""}
                 </span>
@@ -1546,22 +1546,37 @@ function TemperaturePage({ token, onLogout }) {
 
   useEffect(() => {
     if (!token) return;
+    let cancelled = false;
+
     const fetchCurrent = () => {
       apiFetch('/sensors/temperature/current', token)
-        .then(data => setCurrent(data))
+        .then(data => { if (!cancelled) setCurrent(data); })
         .catch(() => {});
     };
     fetchCurrent();
     const id = setInterval(fetchCurrent, 10_000);
-    return () => clearInterval(id);
+
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, [token]);
 
   useEffect(() => {
     if (!token) return;
+    let cancelled = false;
     setLoading(true);
+
     apiFetch(`/sensors/temperature/history?hours=${hours}`, token)
-      .then(data => { setHistory(Array.isArray(data) ? data : []); setLoading(false); })
-      .catch(() => setLoading(false));
+      .then(data => {
+        if (!cancelled) {
+          setHistory(Array.isArray(data) ? data : []);
+          setLoading(false);
+        }
+      })
+      .catch(() => { if (!cancelled) setLoading(false); });
+
+    return () => { cancelled = true; };
   }, [token, hours]);
 
   const chartData = history.map(h => ({
@@ -1635,6 +1650,9 @@ function TemperaturePage({ token, onLogout }) {
 
         {/* Reading + status */}
         <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 8 }}>
+            Jet 27
+          </div>
           <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 4 }}>
             Current Temperature
           </div>
