@@ -174,7 +174,7 @@ _DELTA_CP2000_SPEC = {
     "address": 0x2200,   # Monitor block — confirmed accessible 2026-07-17
     "count":   5,        # 0x2200=current, 0x2201=counter(skip), 0x2202=freq, 0x2203=dc_bus, 0x2204=output_v
     "registers": [
-        ("current",        0,  10),  # 0x2200 Output current    / 10  → A
+        ("current",        0, 100),  # 0x2200 Output current    / 100 → A (corrected 2026-07-19, verified against panel)
         # index 1 = 0x2201 counter — skipped
         ("frequency",      2, 100),  # 0x2202 Output frequency  / 100 → Hz
         ("dc_voltage",     3,  10),  # 0x2203 DC bus voltage    / 10  → V
