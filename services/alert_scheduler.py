@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 
 # --- Configuration ---
 GATEWAY_OFFLINE_THRESHOLD_MINUTES = 20
-OVERCURRENT_THRESHOLD_A           = 10.0  # Amperes — alert when any machine exceeds this
+OVERCURRENT_THRESHOLD_A           = 13.0  # Amperes — alert when any machine exceeds this
 COMPANY_ID                        = 1     # SSPPL — extend to multi-tenant later
 
 # --- In-memory alert state ---
