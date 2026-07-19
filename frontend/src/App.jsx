@@ -642,7 +642,7 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
           <span style={{width:1,height:18,background:C.border}}/>
           {/* Fleet / Analytics tab pills */}
           <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-            {[['fleet', 'Fleet'], ['analytics', 'Analytics']].map(([p, label]) => (
+            {[['fleet', 'Fleet'], ['analytics', 'Analytics'], ['temperature', 'Temperature']].map(([p, label]) => (
               <button key={p} onClick={() => setActivePage(p)} style={{
                 background: activePage === p ? C.red : 'transparent',
                 color: activePage === p ? '#fff' : C.muted,
@@ -778,6 +778,11 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
         {/* Analytics tab */}
         {activePage === 'analytics' && (
           <AnalyticsPage token={token} onLogout={onLogout} />
+        )}
+
+        {/* Temperature tab */}
+        {activePage === 'temperature' && (
+          <TemperaturePage token={token} onLogout={onLogout} />
         )}
       </main>
     </div>
@@ -1529,6 +1534,194 @@ const AnalyticsPage = ({ token, onLogout }) => {
     </div>
   );
 };
+
+/* ═══════════════════════════════════════════════════════════════
+   TEMPERATURE MONITOR PAGE — Electrosil Fx-438 dyebath sensor (Jet 27)
+═══════════════════════════════════════════════════════════════ */
+function TemperaturePage({ token, onLogout }) {
+  const [current, setCurrent]   = useState(null);
+  const [history, setHistory]   = useState([]);
+  const [hours, setHours]       = useState(1);
+  const [loading, setLoading]   = useState(true);
+
+  useEffect(() => {
+    if (!token) return;
+    const fetchCurrent = () => {
+      apiFetch('/sensors/temperature/current', token)
+        .then(data => setCurrent(data))
+        .catch(() => {});
+    };
+    fetchCurrent();
+    const id = setInterval(fetchCurrent, 10_000);
+    return () => clearInterval(id);
+  }, [token]);
+
+  useEffect(() => {
+    if (!token) return;
+    setLoading(true);
+    apiFetch(`/sensors/temperature/history?hours=${hours}`, token)
+      .then(data => { setHistory(Array.isArray(data) ? data : []); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [token, hours]);
+
+  const chartData = history.map(h => ({
+    time: new Date(h.timestamp.endsWith('Z') ? h.timestamp : h.timestamp + 'Z')
+            .toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true }),
+    value: h.value,
+  }));
+
+  const isStaleReading = current?.timestamp &&
+    (Date.now() - new Date(current.timestamp.endsWith('Z') ? current.timestamp : current.timestamp + 'Z').getTime()) > 120_000;
+
+  const TIME_WINDOWS = [1, 3, 6, 12, 24];
+
+  // Thermometer fill calculation — scale 0-120°C to 0-100% fill height
+  // (dyebath process range, adjust min/max if your process range differs)
+  const THERMO_MIN = 0;
+  const THERMO_MAX = 120;
+  const tempValue  = current?.value ?? 0;
+  const fillPct    = Math.max(0, Math.min(100,
+    ((tempValue - THERMO_MIN) / (THERMO_MAX - THERMO_MIN)) * 100
+  ));
+
+  return (
+    <div style={{ padding: '24px 32px', maxWidth: 960, margin: '0 auto' }}>
+
+      <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 4, color: '#1f2937' }}>
+        Dyebath Temperature Monitor
+      </h2>
+      <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 24 }}>
+        Electrosil Fx-438 · Jet 27 dyebath sensor
+      </div>
+
+      {/* Thermometer + current reading card */}
+      <div style={{
+        background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
+        padding: '32px 40px', marginBottom: 24, display: 'flex',
+        alignItems: 'center', gap: 40,
+      }}>
+        {/* SVG Thermometer */}
+        <div style={{ flexShrink: 0 }}>
+          <svg width="70" height="220" viewBox="0 0 70 220">
+            {/* Outer tube outline */}
+            <rect x="25" y="10" width="20" height="160" rx="10"
+              fill="none" stroke="#1f2937" strokeWidth="3" />
+            <circle cx="35" cy="195" r="22"
+              fill="none" stroke="#1f2937" strokeWidth="3" />
+
+            {/* Mercury fill — bulb (always full) */}
+            <circle cx="35" cy="195" r="17"
+              fill={isStaleReading ? '#9ca3af' : '#dc2626'} />
+
+            {/* Mercury fill — tube, height driven by fillPct */}
+            <rect
+              x="30"
+              y={170 - (140 * fillPct / 100)}
+              width="10"
+              height={140 * fillPct / 100 + 15}
+              rx="5"
+              fill={isStaleReading ? '#9ca3af' : '#dc2626'}
+            />
+
+            {/* Tick marks */}
+            {[0, 25, 50, 75, 100].map(pct => (
+              <line key={pct}
+                x1="46" y1={170 - (140 * pct / 100)}
+                x2="52" y2={170 - (140 * pct / 100)}
+                stroke="#9ca3af" strokeWidth="1.5" />
+            ))}
+          </svg>
+        </div>
+
+        {/* Reading + status */}
+        <div style={{ flex: 1 }}>
+          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 4 }}>
+            Current Temperature
+          </div>
+          <div style={{
+            fontSize: 56, fontWeight: 700, lineHeight: 1,
+            color: isStaleReading ? '#9ca3af' : '#dc2626',
+            marginBottom: 12,
+          }}>
+            {current?.value != null ? current.value.toFixed(0) : '—'}
+            <span style={{ fontSize: 24, fontWeight: 400, marginLeft: 4 }}>°C</span>
+          </div>
+
+          {isStaleReading ? (
+            <span style={{
+              background: '#fef3c7', color: '#92400e', padding: '4px 12px',
+              borderRadius: 6, fontSize: 12, fontWeight: 600,
+            }}>STALE</span>
+          ) : current?.value != null ? (
+            <span style={{
+              background: '#dcfce7', color: '#166534', padding: '4px 12px',
+              borderRadius: 6, fontSize: 12, fontWeight: 600,
+            }}>● LIVE</span>
+          ) : null}
+
+          <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 10 }}>
+            {current?.timestamp
+              ? `Updated ${new Date(current.timestamp.endsWith('Z') ? current.timestamp : current.timestamp + 'Z')
+                  .toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second:'2-digit', hour12: true })} IST`
+              : 'No data yet'}
+          </div>
+        </div>
+      </div>
+
+      {/* Time window selector */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 16 }}>
+        {TIME_WINDOWS.map(h => (
+          <button key={h} onClick={() => setHours(h)} style={{
+            padding: '5px 14px', borderRadius: 6, fontSize: 13,
+            background: hours === h ? C.red : 'transparent',
+            color:      hours === h ? '#fff' : '#6b7280',
+            border:     `1px solid ${hours === h ? C.red : '#e5e7eb'}`,
+            cursor: 'pointer', fontWeight: hours === h ? 600 : 400,
+          }}>{h}h</button>
+        ))}
+      </div>
+
+      {/* History chart — area style matching reference image */}
+      <div style={{
+        background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
+        padding: 24,
+      }}>
+        <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 16 }}>
+          Temperature Trend — last {hours}h
+        </div>
+        {loading ? (
+          <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
+        ) : chartData.length === 0 ? (
+          <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
+            No temperature data for this period.
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height={260}>
+            <AreaChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+              <defs>
+                <linearGradient id="tempGradient" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#dc2626" stopOpacity={0.35}/>
+                  <stop offset="95%" stopColor="#dc2626" stopOpacity={0.02}/>
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
+              <XAxis dataKey="time" tick={{ fill: '#9ca3af', fontSize: 11 }} />
+              <YAxis tick={{ fill: '#9ca3af', fontSize: 11 }}
+                tickFormatter={v => `${v}°`} domain={['dataMin - 3', 'dataMax + 3']} />
+              <Tooltip
+                contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
+                  borderRadius: 8, fontSize: 12 }}
+                formatter={(val) => [`${val}°C`, 'Temperature']}
+              />
+              <Area type="monotone" dataKey="value" stroke="#dc2626"
+                strokeWidth={2.5} fill="url(#tempGradient)" />
+            </AreaChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+    </div>
+  );
+}
 
 /* ═══════════════════════════════════════════════════════════════
    APP ROOT
