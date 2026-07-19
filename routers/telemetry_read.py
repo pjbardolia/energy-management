@@ -48,8 +48,19 @@ router = APIRouter()
 def _get_latest_rows(db: Session, company_id: int) -> list:
     """Return the most-recent reading per (component, tag) for one tenant.
 
-    Uses PostgreSQL DISTINCT ON with three JOINs to attach machine_name and
-    tag_key to each row so callers don't need additional queries.
+    PERFORMANCE NOTE (2026-07-19): Previously used a bare DISTINCT ON across
+    the full telemetry_data table, which forced PostgreSQL into a sequential
+    scan + external disk sort as the table grew past ~2M rows (13+ second
+    query time, 60+ second API response under load). Fixed by first finding
+    each component's single latest timestamp within a bounded recent window
+    (uses the ix_telemetry_data_component_tag_ts_desc index for a fast range
+    scan), then joining back to fetch only those exact rows. This avoids
+    sorting the entire table on every request.
+
+    Window is 10 minutes — comfortably covers the ~10-25s poll interval
+    even accounting for a temporary gateway outage; if a component has no
+    reading in the last 10 minutes it simply won't appear (correct — the
+    frontend already treats missing data as NO_DATA/STALE).
 
     tag_key is the stable slug from tag_definition.key ("frequency", "power",
     …) — not the human-editable display name.  Callers use it as the key in
@@ -61,33 +72,42 @@ def _get_latest_rows(db: Session, company_id: int) -> list:
     (e.g. row.machine_name, row.value_num).
     """
     sql = text("""
-        SELECT DISTINCT ON (td.component_instance_id, td.tag_definition_id)
-            td.component_instance_id,
-            td.tag_definition_id,
-            td.value_num,
-            td.value_text,
-            td.timestamp,
+        WITH recent AS (
+            SELECT
+                td.component_instance_id,
+                td.tag_definition_id,
+                td.value_num,
+                td.value_text,
+                td.timestamp,
+                ROW_NUMBER() OVER (
+                    PARTITION BY td.component_instance_id, td.tag_definition_id
+                    ORDER BY td.timestamp DESC
+                ) AS rn
+            FROM telemetry_data td
+            WHERE td.company_id = :company_id
+              AND td.timestamp > NOW() - INTERVAL '10 minutes'
+        )
+        SELECT
+            r.component_instance_id,
+            r.tag_definition_id,
+            r.value_num,
+            r.value_text,
+            r.timestamp,
             m.id          AS machine_id,
             m.name        AS machine_name,
             tdef.key      AS tag_key
-        FROM telemetry_data td
+        FROM recent r
         JOIN machine_component_instance mci
-          ON mci.id = td.component_instance_id
+          ON mci.id = r.component_instance_id
         JOIN machine m
           ON m.id = mci.machine_id
         JOIN tag_definition tdef
-          ON tdef.id = td.tag_definition_id
-        WHERE td.company_id = :company_id
-        ORDER BY
-            td.component_instance_id,
-            td.tag_definition_id,
-            td.timestamp DESC
+          ON tdef.id = r.tag_definition_id
+        WHERE r.rn = 1
     """)
 
     result = db.execute(sql, {"company_id": company_id})
 
-    # mappings() returns each row as a dict-like RowMapping so field access
-    # works by name (row.machine_name) rather than positional index.
     return result.mappings().all()
 
 
