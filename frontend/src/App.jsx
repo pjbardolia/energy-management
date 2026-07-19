@@ -634,22 +634,24 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
         @media(max-width:960px){.fg{grid-template-columns:repeat(3,1fr)!important}}
         @media(max-width:650px){.fg{grid-template-columns:repeat(2,1fr)!important}.ks{grid-template-columns:repeat(2,1fr)!important}}
         @media(max-width:400px){.fg{grid-template-columns:1fr!important}}
+        @media(max-width:640px){.hide-on-mobile{display:none!important}}
       `}</style>
 
       {/* Header */}
       <header style={{
         background:C.white, borderBottom:`1px solid ${C.border}`,
-        padding:"0 24px", height:56,
+        padding:"12px 20px", minHeight:56,
         display:"flex", alignItems:"center", justifyContent:"space-between",
+        flexWrap:"wrap", gap:"8px 12px",
         position:"sticky", top:0, zIndex:100,
       }}>
-        <div style={{display:"flex",alignItems:"center",gap:14}}>
+        <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
           <div style={{display:"flex",alignItems:"center",gap:8}}>
             <img src="/mevion-logo.png" style={{height:48, width:"auto"}} alt="mevion"/>
           </div>
           <span style={{width:1,height:18,background:C.border}}/>
           {/* Fleet / Analytics tab pills */}
-          <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }}>
             {[['fleet', 'Fleet'], ['analytics', 'Analytics'], ['temperature', 'Temperature']].map(([p, label]) => (
               <button key={p} onClick={() => setActivePage(p)} style={{
                 background: activePage === p ? C.red : 'transparent',
@@ -661,11 +663,11 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
             ))}
           </div>
         </div>
-        <div style={{display:"flex",alignItems:"center",gap:14}}>
+        <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
           {/* Gateway status badge — shown once the first /gateway/status fetch returns.
               Hidden on null (failed fetch or first load) so the header stays clean. */}
           {gatewayStatus !== null && (
-            <div style={{display:"flex",alignItems:"center",gap:6,fontSize:13}}>
+            <div style={{display:"flex",alignItems:"center",gap:6,fontSize:13,flexWrap:"wrap"}}>
               {/* Coloured dot: green = online, amber = offline */}
               <span style={{
                 width:8, height:8, borderRadius:"50%", display:"inline-block", flexShrink:0,
@@ -689,7 +691,7 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
               )}
             </div>
           )}
-          <span style={{fontSize:12,color:C.muted}}>{time} IST</span>
+          <span className="hide-on-mobile" style={{fontSize:12,color:C.muted}}>{time} IST</span>
           <button className="so" onClick={onLogout} style={{
             padding:"6px 14px", border:`1.5px solid ${C.border}`,
             borderRadius:8, background:C.white, cursor:"pointer",
@@ -1249,7 +1251,7 @@ const AnalyticsPage = ({ token, onLogout }) => {
                   <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
                     tickFormatter={d => d.slice(5)} />
                   <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
-                    tickFormatter={v => `${v}h`} />
+                    tickFormatter={v => `${Math.round(v)}h`} />
                   <Tooltip
                     contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
                       borderRadius: 8, fontSize: 12 }}
@@ -1274,9 +1276,10 @@ const AnalyticsPage = ({ token, onLogout }) => {
           </div>
 
           {/* Summary table */}
-          <div style={{ background: lt.card, borderRadius: 12, padding: '20px 24px', border: `1px solid ${lt.border}`, overflowX: 'auto' }}>
+          <div style={{ background: lt.card, borderRadius: 12, padding: '20px 24px', border: `1px solid ${lt.border}` }}>
             <div style={{ fontSize: 14, fontWeight: 700, color: lt.text, marginBottom: 16 }}>Machine summary</div>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+            <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, minWidth: 640 }}>
               <thead>
                 <tr style={{ color: lt.muted, borderBottom: `1px solid ${lt.border}` }}>
                   {['Machine', 'Total runtime', 'Utilisation', 'Avg / day', 'Best day', 'Days w/ data'].map(h => (
@@ -1301,6 +1304,7 @@ const AnalyticsPage = ({ token, onLogout }) => {
                 ))}
               </tbody>
             </table>
+            </div>
           </div>
         </>
       )}
@@ -1325,7 +1329,7 @@ const AnalyticsPage = ({ token, onLogout }) => {
                   <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
                     tickFormatter={d => d.slice(5)} />
                   <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
-                    tickFormatter={v => `${v}h`} domain={[0, 'auto']} />
+                    tickFormatter={v => `${Math.round(v)}h`} domain={[0, 'auto']} />
                   <Tooltip
                     contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
                       borderRadius: 8, fontSize: 12 }}
@@ -1411,7 +1415,7 @@ const AnalyticsPage = ({ token, onLogout }) => {
                     <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
                       tickFormatter={d => d.slice(5)} />
                     <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
-                      tickFormatter={v => `${v}kWh`} />
+                      tickFormatter={v => `${Math.round(v)}kWh`} />
                     <Tooltip
                       contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
                         borderRadius: 8, fontSize: 12 }}
@@ -1438,7 +1442,8 @@ const AnalyticsPage = ({ token, onLogout }) => {
 
             {/* Cost summary table */}
             <div style={{ background: lt.card, borderRadius: 12, overflow: 'hidden', border: `1px solid ${lt.border}` }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, minWidth: 640 }}>
                 <thead>
                   <tr style={{ borderBottom: `1px solid ${lt.border}` }}>
                     {['Machine', 'Total kWh', 'Total Cost (₹)', 'Avg kWh / Day', 'Peak Day'].map(h => (
@@ -1471,6 +1476,7 @@ const AnalyticsPage = ({ token, onLogout }) => {
                   </tr>
                 </tbody>
               </table>
+              </div>
             </div>
           </>
         );
@@ -1502,7 +1508,7 @@ const AnalyticsPage = ({ token, onLogout }) => {
                     <XAxis dataKey="day" tick={{ fill: '#6b7280', fontSize: 11 }}
                       tickFormatter={d => d.slice(5)} />
                     <YAxis tick={{ fill: '#6b7280', fontSize: 11 }}
-                      tickFormatter={v => `${v}kWh`} />
+                      tickFormatter={v => `${Math.round(v)}kWh`} />
                     <Tooltip
                       contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
                         borderRadius: 8, fontSize: 12 }}
@@ -1523,7 +1529,7 @@ const AnalyticsPage = ({ token, onLogout }) => {
             </div>
 
             {/* Summary cards */}
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginTop: 8 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 16, marginTop: 8 }}>
               {[
                 { label: 'Total Energy', value: `${s.total_kwh.toFixed(1)} kWh`                 },
                 { label: 'Total Cost',   value: `₹${s.total_cost_inr.toFixed(0)}`, color: '#16a34a' },
@@ -1732,7 +1738,7 @@ function TemperaturePage({ token, onLogout }) {
               <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
               <XAxis dataKey="time" tick={{ fill: '#9ca3af', fontSize: 11 }} />
               <YAxis tick={{ fill: '#9ca3af', fontSize: 11 }}
-                tickFormatter={v => `${v}°`} domain={['dataMin - 3', 'dataMax + 3']} />
+                tickFormatter={v => `${Math.round(v)}°`} domain={['dataMin - 3', 'dataMax + 3']} />
               <Tooltip
                 contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
                   borderRadius: 8, fontSize: 12 }}
