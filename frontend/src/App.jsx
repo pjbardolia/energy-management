@@ -1602,12 +1602,9 @@ function TemperaturePage({ token, onLogout }) {
   return (
     <div style={{ padding: '24px 32px', maxWidth: 960, margin: '0 auto' }}>
 
-      <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 4, color: '#1f2937' }}>
+      <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 24, color: '#1f2937' }}>
         Dyebath Temperature Monitor
       </h2>
-      <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 24 }}>
-        Electrosil Fx-438 · Jet 27 dyebath sensor
-      </div>
 
       {/* Thermometer + current reading card */}
       <div style={{
