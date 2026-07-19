@@ -360,3 +360,76 @@ def get_history(
         hours=hours,
         data=data,
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /sensors/temperature/current, /sensors/temperature/history
+#
+# The Electrosil Fx-438 dyebath temperature sensor is a standalone sensor
+# device, not a VFD-driven machine component — Jet 27 (machine_id=14) now has
+# TWO component instances (Reel Motor id=15, Temp Sensor id=29), so the
+# existing /machines/{id}/history endpoint (which assumes one component per
+# machine and grabs the first match via fetchone()) can't be reused cleanly.
+# These endpoints go straight to component_instance_id=29 / tag_definition_id=8
+# instead — hardcoded because this is currently the only such sensor.
+# ---------------------------------------------------------------------------
+
+_TEMPERATURE_TAG_ID       = 8
+_TEMPERATURE_COMPONENT_ID = 29
+
+
+@router.get("/sensors/temperature/current")
+def get_temperature_current(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
+):
+    """Latest temperature reading from the Electrosil Fx-438 dyebath sensor."""
+    company_id = current_user["company_id"]
+    row = db.execute(text("""
+        SELECT td.value_num, td.timestamp
+        FROM telemetry_data td
+        WHERE td.tag_definition_id     = :tag_id
+          AND td.company_id            = :company_id
+          AND td.component_instance_id = :component_id
+        ORDER BY td.timestamp DESC
+        LIMIT 1
+    """), {
+        "tag_id":       _TEMPERATURE_TAG_ID,
+        "company_id":   company_id,
+        "component_id": _TEMPERATURE_COMPONENT_ID,
+    }).mappings().first()
+
+    if not row:
+        return {"value": None, "timestamp": None}
+    return {"value": float(row["value_num"]), "timestamp": row["timestamp"].isoformat()}
+
+
+@router.get("/sensors/temperature/history")
+def get_temperature_history(
+    hours: int = Query(default=1, ge=1, le=168),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
+):
+    """Temperature history for the last N hours (1–168) from the dyebath sensor."""
+    company_id = current_user["company_id"]
+    since = datetime.utcnow() - timedelta(hours=hours)
+
+    rows = db.execute(text("""
+        SELECT td.value_num, td.timestamp
+        FROM telemetry_data td
+        WHERE td.tag_definition_id     = :tag_id
+          AND td.company_id            = :company_id
+          AND td.component_instance_id = :component_id
+          AND td.timestamp             >= :since
+        ORDER BY td.timestamp ASC
+    """), {
+        "tag_id":       _TEMPERATURE_TAG_ID,
+        "company_id":   company_id,
+        "component_id": _TEMPERATURE_COMPONENT_ID,
+        "since":        since,
+    }).mappings().all()
+
+    return [
+        {"value": float(r["value_num"]), "timestamp": r["timestamp"].isoformat()}
+        for r in rows
+    ]
