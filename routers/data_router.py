@@ -102,18 +102,18 @@ def create_data_batch(
     # db.refresh() is intentionally omitted — TimescaleDB's composite PK
     # (id, timestamp) breaks the SELECT-by-PK that refresh() issues internally.
     db_rows = [
-        TelemetryData(
-            timestamp=item.timestamp,
-            component_instance_id=item.component_instance_id,
-            tag_definition_id=item.tag_definition_id,
-            value_num=item.value_num,
-            value_text=item.value_text,
-            company_id=company_id,   # from the token, never the body
-        )
+        {
+            "timestamp": item.timestamp,
+            "component_instance_id": item.component_instance_id,
+            "tag_definition_id": item.tag_definition_id,
+            "value_num": item.value_num,
+            "value_text": item.value_text,
+            "company_id": company_id,   # from the token, never the body
+        }
         for item in batch.readings
     ]
-    db.add_all(db_rows)
     try:
+        db.bulk_insert_mappings(TelemetryData, db_rows)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -123,7 +123,6 @@ def create_data_batch(
         )
 
     return TelemetryBatchResponse(accepted=len(db_rows), rejected=0)
-
 
 @router.get("/data", response_model=list[DataResponse])
 def get_data(
