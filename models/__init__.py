@@ -26,3 +26,5 @@ from .component_type_tag import ComponentTypeTag
 from .telemetry_data import TelemetryData
 
 from .gateway_heartbeat import GatewayHeartbeat
+
+from .machine_state_event import MachineStateEvent, MachineState

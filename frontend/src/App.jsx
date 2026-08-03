@@ -662,7 +662,7 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
           <span style={{width:1,height:18,background:C.border}}/>
           {/* Fleet / Analytics tab pills */}
           <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }}>
-            {[['fleet', 'Fleet'], ['analytics', 'Analytics'], ['temperature', 'Temperature & Pressure']].map(([p, label]) => (
+            {[['fleet', 'Fleet'], ['analytics', 'Analytics'], ['temperature', 'Temperature & Pressure'], ['uptime', 'Uptime']].map(([p, label]) => (
               <button key={p} onClick={() => setActivePage(p)} style={{
                 background: activePage === p ? C.red : 'transparent',
                 color: activePage === p ? '#fff' : C.muted,
@@ -803,6 +803,11 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
         {/* Temperature & Pressure tab */}
         {activePage === 'temperature' && (
           <TemperatureAndPressurePage token={token} onLogout={onLogout} />
+        )}
+
+        {/* Uptime tab — Gantt timeline, heatmap calendar, OEE availability cards */}
+        {activePage === 'uptime' && (
+          <UptimePage token={token} onLogout={onLogout} />
         )}
       </main>
     </div>
@@ -2061,6 +2066,357 @@ function TemperatureAndPressurePage({ token, onLogout }) {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   UPTIME PAGE — Gantt timeline, heatmap calendar, OEE availability cards.
+   All three read from machine_state_event via /machines/state-timeline and
+   /machines/utilization-daily — never raw telemetry.
+═══════════════════════════════════════════════════════════════ */
+
+// Gantt time-range options — reuses the existing 1h/3h/6h/12h/24h button
+// pattern already built for the Temperature & Pressure page, extended with
+// 7d/30d since shift/day patterns matter more for a Gantt view.
+const GANTT_RANGES = [
+  { label: '1h', hours: 1 }, { label: '3h', hours: 3 }, { label: '6h', hours: 6 },
+  { label: '12h', hours: 12 }, { label: '24h', hours: 24 },
+  { label: '7d', hours: 24 * 7 }, { label: '30d', hours: 24 * 30 },
+];
+
+const HEATMAP_DAY_OPTIONS = [7, 30, 90];
+
+// Day+time 24-hour label for longer Gantt ranges (7d/30d), where a bare
+// HH:MM axis tick would be ambiguous across multiple days.
+function fmtDayTime24(d) {
+  return d.toLocaleString('en-GB', {
+    timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+}
+
+function fmtDuration(minutes) {
+  const h = Math.floor(minutes / 60);
+  const m = Math.round(minutes % 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+// ── Gantt sub-view ─────────────────────────────────────────────────────
+function GanttView({ token, onLogout }) {
+  const [rangeHours, setRangeHours] = useState(24);
+  const [timeline, setTimeline] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    const fetchTimeline = () => {
+      const to = new Date();
+      const from = new Date(to.getTime() - rangeHours * 3600_000);
+      apiFetch(`/machines/state-timeline?from=${from.toISOString()}&to=${to.toISOString()}`, token)
+        .then(data => { if (!cancelled) { setTimeline(data); setLoading(false); } })
+        .catch(e => { if (!cancelled) { setLoading(false); if (e.status === 401) onLogout(); } });
+    };
+    setLoading(true);
+    fetchTimeline();
+    const id = setInterval(fetchTimeline, 30_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [token, rangeHours, onLogout]);
+
+  const machines = timeline?.machines || [];
+  const fromMs = timeline ? new Date(timeline.range_from).getTime() : 0;
+  const toMs   = timeline ? new Date(timeline.range_to).getTime() : 1;
+  const totalMs = Math.max(1, toMs - fromMs);
+  const fmtTick = rangeHours <= 24 ? fmtIST24 : fmtDayTime24;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 4, marginBottom: 16 }}>
+        {GANTT_RANGES.map(r => (
+          <button key={r.label} onClick={() => setRangeHours(r.hours)} style={{
+            padding: '5px 14px', borderRadius: 6, fontSize: 13,
+            background: rangeHours === r.hours ? C.red : 'transparent',
+            color:      rangeHours === r.hours ? '#fff' : '#6b7280',
+            border:     `1px solid ${rangeHours === r.hours ? C.red : '#e5e7eb'}`,
+            cursor: 'pointer', fontWeight: rangeHours === r.hours ? 600 : 400,
+          }}>{r.label}</button>
+        ))}
+      </div>
+
+      <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16, padding: 24 }}>
+        {loading ? (
+          <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
+        ) : machines.length === 0 ? (
+          <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
+            No state data for this period yet.
+          </div>
+        ) : (
+          <>
+            {/* Time axis */}
+            <div style={{ display: 'flex', marginLeft: 110, position: 'relative', height: 20, marginBottom: 4 }}>
+              {[0, 0.2, 0.4, 0.6, 0.8, 1].map(frac => (
+                <span key={frac} style={{
+                  position: 'absolute', left: `${frac * 100}%`,
+                  transform: frac === 1 ? 'translateX(-100%)' : frac === 0 ? 'none' : 'translateX(-50%)',
+                  fontSize: 10, color: '#9ca3af', whiteSpace: 'nowrap',
+                }}>
+                  {fmtTick(new Date(fromMs + frac * totalMs))}
+                </span>
+              ))}
+            </div>
+
+            {/* Rows — compact height so all machines fit without excessive scrolling */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+              {machines.map(m => (
+                <div key={m.machine_id} style={{ display: 'flex', alignItems: 'center', height: 22 }}>
+                  <div style={{
+                    width: 110, flexShrink: 0, fontSize: 11, color: '#374151',
+                    fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}>{m.machine_name}</div>
+                  <div style={{ position: 'relative', flex: 1, height: 16, background: '#f3f4f6', borderRadius: 3 }}>
+                    {m.intervals.map((iv, i) => {
+                      const start = new Date(iv.started_at).getTime();
+                      const end   = new Date(iv.ended_at).getTime();
+                      const left  = Math.max(0, ((start - fromMs) / totalMs) * 100);
+                      const width = Math.max(0.3, ((end - start) / totalMs) * 100);
+                      const durationMin = (end - start) / 60000;
+                      return (
+                        <div key={i}
+                          title={`${iv.state === 'running' ? 'Running' : 'Stopped'}: ${new Date(start).toLocaleString('en-GB', { timeZone: 'Asia/Kolkata' })} → ${new Date(end).toLocaleString('en-GB', { timeZone: 'Asia/Kolkata' })} (${fmtDuration(durationMin)})`}
+                          style={{
+                            position: 'absolute', left: `${left}%`, width: `${width}%`,
+                            top: 0, bottom: 0,
+                            background: iv.state === 'running' ? C.running : C.stopped,
+                            borderRadius: 2,
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Legend */}
+            <div style={{ display: 'flex', gap: 16, marginTop: 16, fontSize: 11, color: '#6b7280' }}>
+              <span><span style={{ display: 'inline-block', width: 10, height: 10, background: C.running, borderRadius: 2, marginRight: 5 }} />Running</span>
+              <span><span style={{ display: 'inline-block', width: 10, height: 10, background: C.stopped, borderRadius: 2, marginRight: 5 }} />Stopped</span>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Heatmap sub-view ───────────────────────────────────────────────────
+// GitHub-contribution-graph color scale: light grey (no/low utilization) to
+// dark green (high utilization) — same visual concept, deliberately separate
+// from the Gantt's exact-timing detail (spots slow multi-week trends instead).
+function heatmapColor(pct) {
+  if (pct <= 0)   return '#ebedf0';
+  if (pct < 25)   return '#c6e6c3';
+  if (pct < 50)   return '#7bc96f';
+  if (pct < 75)   return '#39a935';
+  return '#196127';
+}
+
+function HeatmapView({ token, onLogout }) {
+  const [days, setDays] = useState(30);
+  const [fleetData, setFleetData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setLoading(true);
+    const to = new Date();
+    const from = new Date(to); from.setDate(from.getDate() - (days - 1));
+    const toDate = to.toISOString().slice(0, 10);
+    const fromDate = from.toISOString().slice(0, 10);
+    apiFetch(`/machines/utilization-daily?from_date=${fromDate}&to_date=${toDate}`, token)
+      .then(data => { if (!cancelled) { setFleetData(data); setLoading(false); } })
+      .catch(e => { if (!cancelled) { setLoading(false); if (e.status === 401) onLogout(); } });
+    return () => { cancelled = true; };
+  }, [token, days, onLogout]);
+
+  const machines = fleetData?.machines || [];
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 4, marginBottom: 16 }}>
+        {HEATMAP_DAY_OPTIONS.map(d => (
+          <button key={d} onClick={() => setDays(d)} style={{
+            padding: '5px 14px', borderRadius: 6, fontSize: 13,
+            background: days === d ? C.red : 'transparent',
+            color:      days === d ? '#fff' : '#6b7280',
+            border:     `1px solid ${days === d ? C.red : '#e5e7eb'}`,
+            cursor: 'pointer', fontWeight: days === d ? 600 : 400,
+          }}>{d}d</button>
+        ))}
+      </div>
+
+      <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16, padding: 24 }}>
+        {loading ? (
+          <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
+        ) : machines.length === 0 ? (
+          <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
+            No utilization data for this period yet.
+          </div>
+        ) : (
+          <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
+            <div style={{ display: 'inline-block', minWidth: '100%' }}>
+              {machines.map(m => (
+                <div key={m.machine_id} style={{ display: 'flex', alignItems: 'center', marginBottom: 3 }}>
+                  <div style={{
+                    width: 110, flexShrink: 0, fontSize: 11, color: '#374151',
+                    fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}>{m.machine_name}</div>
+                  <div style={{ display: 'flex', gap: 2 }}>
+                    {m.daily_rows.map(row => (
+                      <div key={row.operational_day}
+                        title={`${row.operational_day.slice(0, 10)}: ${row.utilization_pct}% (${fmtDuration(row.running_minutes)} running)`}
+                        style={{
+                          width: 14, height: 14, borderRadius: 3,
+                          background: heatmapColor(row.utilization_pct),
+                        }}
+                      />
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 16, fontSize: 11, color: '#6b7280' }}>
+          <span>Less</span>
+          {[0, 20, 40, 60, 90].map(pct => (
+            <div key={pct} style={{ width: 12, height: 12, borderRadius: 3, background: heatmapColor(pct) }} />
+          ))}
+          <span>More</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── OEE availability cards sub-view ────────────────────────────────────
+function OEECardsView({ token, onLogout }) {
+  const [period, setPeriod] = useState('today'); // 'today' | 'week'
+  const [sortOrder, setSortOrder] = useState('worst'); // 'worst' | 'best'
+  const [fleetData, setFleetData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setLoading(true);
+    const to = new Date();
+    const from = new Date(to);
+    if (period === 'week') from.setDate(from.getDate() - 6);
+    const toDate = to.toISOString().slice(0, 10);
+    const fromDate = from.toISOString().slice(0, 10);
+    apiFetch(`/machines/utilization-daily?from_date=${fromDate}&to_date=${toDate}`, token)
+      .then(data => { if (!cancelled) { setFleetData(data); setLoading(false); } })
+      .catch(e => { if (!cancelled) { setLoading(false); if (e.status === 401) onLogout(); } });
+    return () => { cancelled = true; };
+  }, [token, period, onLogout]);
+
+  const cards = (fleetData?.machines || []).map(m => {
+    const running = m.daily_rows.reduce((a, r) => a + r.running_minutes, 0);
+    const elapsed = m.daily_rows.reduce((a, r) => a + r.elapsed_minutes, 0);
+    const availability = elapsed > 0 ? (running / elapsed) * 100 : 0;
+    return { machine_id: m.machine_id, machine_name: m.machine_name, running, elapsed, availability };
+  });
+  cards.sort((a, b) => sortOrder === 'worst' ? a.availability - b.availability : b.availability - a.availability);
+
+  return (
+    <div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, marginBottom: 16, justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {[['today', 'Today'], ['week', 'This Week']].map(([val, label]) => (
+            <button key={val} onClick={() => setPeriod(val)} style={{
+              padding: '5px 14px', borderRadius: 6, fontSize: 13,
+              background: period === val ? C.red : 'transparent',
+              color:      period === val ? '#fff' : '#6b7280',
+              border:     `1px solid ${period === val ? C.red : '#e5e7eb'}`,
+              cursor: 'pointer', fontWeight: period === val ? 600 : 400,
+            }}>{label}</button>
+          ))}
+        </div>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {[['worst', 'Worst first'], ['best', 'Best first']].map(([val, label]) => (
+            <button key={val} onClick={() => setSortOrder(val)} style={{
+              padding: '5px 14px', borderRadius: 6, fontSize: 13,
+              background: sortOrder === val ? '#374151' : 'transparent',
+              color:      sortOrder === val ? '#fff' : '#6b7280',
+              border:     `1px solid ${sortOrder === val ? '#374151' : '#e5e7eb'}`,
+              cursor: 'pointer', fontWeight: sortOrder === val ? 600 : 400,
+            }}>{label}</button>
+          ))}
+        </div>
+      </div>
+
+      {loading ? (
+        <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
+      ) : cards.length === 0 ? (
+        <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
+          No utilization data for this period yet.
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 14 }}>
+          {cards.map(c => {
+            // Same availability color convention already used in the Analytics
+            // summary table (utilisation_pct >= 70 green / >= 40 amber / red).
+            const color = c.availability >= 70 ? '#16a34a' : c.availability >= 40 ? '#d97706' : '#dc2626';
+            return (
+              <div key={c.machine_id} style={{
+                background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: '16px 18px',
+              }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: '#111827', marginBottom: 8 }}>
+                  {c.machine_name}
+                </div>
+                <div style={{ fontSize: 28, fontWeight: 800, color, fontVariantNumeric: 'tabular-nums' }}>
+                  {c.availability.toFixed(0)}<span style={{ fontSize: 14, fontWeight: 400 }}>%</span>
+                </div>
+                <div style={{ fontSize: 11, color: '#9ca3af', marginTop: 6 }}>
+                  {fmtDuration(c.running)} / {fmtDuration(c.elapsed)}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UptimePage({ token, onLogout }) {
+  const [view, setView] = useState('gantt'); // 'gantt' | 'heatmap' | 'oee'
+
+  return (
+    <div style={{ padding: '24px 32px', maxWidth: 1200, margin: '0 auto' }}>
+      <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 16, color: '#1f2937' }}>
+        Machine Uptime
+      </h2>
+
+      <div style={{ display: 'flex', gap: 4, marginBottom: 20 }}>
+        {[['gantt', 'Gantt Timeline'], ['heatmap', 'Heatmap Calendar'], ['oee', 'OEE Cards']].map(([val, label]) => (
+          <button key={val} onClick={() => setView(val)} style={{
+            padding: '6px 16px', borderRadius: 6, fontSize: 13,
+            background: view === val ? C.red : 'transparent',
+            color:      view === val ? '#fff' : '#6b7280',
+            border:     `1px solid ${view === val ? C.red : '#e5e7eb'}`,
+            cursor: 'pointer', fontWeight: view === val ? 600 : 400,
+          }}>{label}</button>
+        ))}
+      </div>
+
+      {view === 'gantt'   && <GanttView token={token} onLogout={onLogout} />}
+      {view === 'heatmap' && <HeatmapView token={token} onLogout={onLogout} />}
+      {view === 'oee'     && <OEECardsView token={token} onLogout={onLogout} />}
     </div>
   );
 }

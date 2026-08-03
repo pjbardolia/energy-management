@@ -35,7 +35,9 @@ from routers.telemetry_read import router as telemetry_read_router
 from routers.gateway_heartbeat import router as gateway_heartbeat_router
 from routers.runtime import router as runtime_router
 from routers.energy import router as energy_router
+from routers.machine_state import router as machine_state_router
 from services.alert_scheduler import start_alert_scheduler
+from services.state_tracker import start_state_tracker
 
 from passlib.context import CryptContext
 
@@ -57,10 +59,14 @@ if os.getenv("DEVELOPMENT_MODE", "").lower() == "true":
 @asynccontextmanager
 async def lifespan(app):
     # Startup: launch the background alert scheduler (gateway offline + overcurrent)
+    # and the machine state-transition tracker (machine_state_event writes) —
+    # two independent BackgroundScheduler instances, each started/stopped on its own.
     scheduler = start_alert_scheduler()
+    state_scheduler = start_state_tracker()
     yield
     # Shutdown: stop gracefully so APScheduler threads don't outlive the process
     scheduler.shutdown(wait=False)
+    state_scheduler.shutdown(wait=False)
 
 
 app = FastAPI(
@@ -85,6 +91,7 @@ app.include_router(telemetry_read_router)      # GET /machines/live, /fleet/summ
 app.include_router(gateway_heartbeat_router)  # POST /gateway/heartbeat, GET /gateway/status
 app.include_router(runtime_router)            # GET /runtime/fleet/current-shift, /fleet/range, /machines/{id}/range
 app.include_router(energy_router)             # GET /energy/fleet/current-shift, /fleet/range, /machines/{id}/range
+app.include_router(machine_state_router)      # GET /machines/{id}/state-timeline, /machines/state-timeline, /machines/{id}/utilization-daily
 
 # Password hashing context — bcrypt==4.0.1 is pinned in requirements.txt
 # because newer bcrypt versions break passlib's internal API.
