@@ -456,7 +456,7 @@ const Tile = ({machine, onClick, runtime, energy}) => {
         </div>
       </div>
 
-      {/* Metrics 2×2
+      {/* Metrics 2×2 (2×3 when a machine also has a pressure reading — e.g. Jet 27)
           RUNNING: accent red / C.text values.
           STOPPED: grey values — real zeros, not dashes (VFD is powered, motor idle).
           STALE:   muted last-known values — not dashes (operator needs last reading).
@@ -467,6 +467,12 @@ const Tile = ({machine, onClick, runtime, energy}) => {
           {label:"Power",     val:fmt(machine.tags?.power),      unit:"kW", big:true,  accent:true  },
           {label:"Current",   val:fmt(machine.tags?.current),    unit:"A",  big:false, accent:false },
           {label:"RPM",       val:fmt(machine.tags?.rpm, 0),     unit:"",   big:false, accent:false },
+          // Pressure — only present on machines with a pressure transmitter component
+          // instance (currently Jet 27 only). Absent from machine.tags for every
+          // other machine, so this metric simply doesn't render elsewhere.
+          ...(machine.tags?.pressure != null
+            ? [{label:"Pressure", val:fmt(machine.tags.pressure), unit:"kg/cm²", big:false, accent:false}]
+            : []),
         ].map(m=>{
           const valueColor =
             state === 'RUNNING' ? (m.accent ? C.red : C.text) :
