@@ -1583,9 +1583,15 @@ const PRESSURE_RANGE = { min: 0, max: 6.118 };
 
 // 24-hour IST time label — used for chart x-axes (requirement: no AM/PM,
 // avoids the "07:45 pm07:49 pn" overlap the 12-hour format produced).
-function fmtIST24(utcStr) {
-  if (!utcStr) return '—';
-  const d = new Date(utcStr.endsWith('Z') ? utcStr : utcStr + 'Z');
+// Accepts either an ISO timestamp string (chart bucket data from the API) or
+// an already-constructed Date object (e.g. GanttView's computed tick marks) —
+// calling .endsWith on a Date threw "e.endsWith is not a function" and blanked
+// the whole Uptime tab.
+function fmtIST24(value) {
+  if (!value) return '—';
+  const d = value instanceof Date
+    ? value
+    : new Date(value.endsWith('Z') ? value : value + 'Z');
   return d.toLocaleTimeString('en-GB', {
     timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false,
   });
