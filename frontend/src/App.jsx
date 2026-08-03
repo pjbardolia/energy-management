@@ -456,7 +456,7 @@ const Tile = ({machine, onClick, runtime, energy}) => {
         </div>
       </div>
 
-      {/* Metrics 2×2 (2×3 when a machine also has a pressure reading — e.g. Jet 27)
+      {/* Metrics 2×2 (grows to accommodate temperature/pressure when present)
           RUNNING: accent red / C.text values.
           STOPPED: grey values — real zeros, not dashes (VFD is powered, motor idle).
           STALE:   muted last-known values — not dashes (operator needs last reading).
@@ -467,9 +467,13 @@ const Tile = ({machine, onClick, runtime, energy}) => {
           {label:"Power",     val:fmt(machine.tags?.power),      unit:"kW", big:true,  accent:true  },
           {label:"Current",   val:fmt(machine.tags?.current),    unit:"A",  big:false, accent:false },
           {label:"RPM",       val:fmt(machine.tags?.rpm, 0),     unit:"",   big:false, accent:false },
-          // Pressure — only present on machines with a pressure transmitter component
-          // instance (currently Jet 27 only). Absent from machine.tags for every
-          // other machine, so this metric simply doesn't render elsewhere.
+          // Temperature and pressure — only present on machines with the
+          // corresponding sensor component instance. Absent from machine.tags
+          // for every other machine, so these metrics simply don't render
+          // elsewhere. A machine could have neither, either, or both.
+          ...(machine.tags?.temperature != null
+            ? [{label:"Temperature", val:fmt(machine.tags.temperature), unit:"°C", big:false, accent:false}]
+            : []),
           ...(machine.tags?.pressure != null
             ? [{label:"Pressure", val:fmt(machine.tags.pressure), unit:"kg/cm²", big:false, accent:false}]
             : []),
@@ -658,7 +662,7 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
           <span style={{width:1,height:18,background:C.border}}/>
           {/* Fleet / Analytics tab pills */}
           <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }}>
-            {[['fleet', 'Fleet'], ['analytics', 'Analytics'], ['temperature', 'Temperature']].map(([p, label]) => (
+            {[['fleet', 'Fleet'], ['analytics', 'Analytics'], ['temperature', 'Temperature & Pressure']].map(([p, label]) => (
               <button key={p} onClick={() => setActivePage(p)} style={{
                 background: activePage === p ? C.red : 'transparent',
                 color: activePage === p ? '#fff' : C.muted,
@@ -796,9 +800,9 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
           <AnalyticsPage token={token} onLogout={onLogout} />
         )}
 
-        {/* Temperature tab */}
+        {/* Temperature & Pressure tab */}
         {activePage === 'temperature' && (
-          <TemperaturePage token={token} onLogout={onLogout} />
+          <TemperatureAndPressurePage token={token} onLogout={onLogout} />
         )}
       </main>
     </div>
@@ -1140,9 +1144,9 @@ const AnalyticsPage = ({ token, onLogout }) => {
       .finally(() => setLoading(false));
   }, [view, fromDate, toDate, selectedMachine, token, onLogout, analyticsTab]);
 
-  // Light theme tokens (Analytics panel only — matches TemperaturePage's white theme).
+  // Light theme tokens (Analytics panel only — matches TemperatureAndPressurePage's white theme).
   // bg is transparent so the panel inherits the page's light-gray background (C.bg),
-  // letting the white bordered cards stand out — same visual hierarchy as TemperaturePage.
+  // letting the white bordered cards stand out — same visual hierarchy as TemperatureAndPressurePage.
   const lt = {
     bg:     'transparent',
     card:   '#ffffff',
@@ -1558,13 +1562,148 @@ const AnalyticsPage = ({ token, onLogout }) => {
 };
 
 /* ═══════════════════════════════════════════════════════════════
-   TEMPERATURE MONITOR PAGE — Electrosil Fx-438 dyebath sensor (Jet 27)
+   TEMPERATURE & PRESSURE PAGE — data-driven, machine-agnostic.
+   Any machine with a temperature and/or pressure tag in its /machines/live
+   payload appears in the selector below; nothing is hardcoded to Jet 27.
 ═══════════════════════════════════════════════════════════════ */
-function TemperaturePage({ token, onLogout }) {
-  const [current, setCurrent]   = useState(null);
-  const [history, setHistory]   = useState([]);
-  const [hours, setHours]       = useState(1);
-  const [loading, setLoading]   = useState(true);
+
+// Display ranges for the two gauge types. Not exposed anywhere in the DB
+// today (tag_definition has no min/max columns), so — same as the original
+// thermometer — these live here as named constants rather than per-card
+// literals. Pressure range matches the Baumer CTX3.2.3.B20.0 transmitters
+// currently deployed (0-6 bar rated, converted to kg/cm² by the gateway's
+// read_ai8ch_pressure(): 6 bar × 1.01972 kg/cm²/bar = 6.118).
+const TEMP_RANGE     = { min: 0, max: 120 };
+const PRESSURE_RANGE = { min: 0, max: 6.118 };
+
+// 24-hour IST time label — used for chart x-axes (requirement: no AM/PM,
+// avoids the "07:45 pm07:49 pn" overlap the 12-hour format produced).
+function fmtIST24(utcStr) {
+  if (!utcStr) return '—';
+  const d = new Date(utcStr.endsWith('Z') ? utcStr : utcStr + 'Z');
+  return d.toLocaleTimeString('en-GB', {
+    timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+}
+
+// angleDeg: 0 = due east (right), 90 = due north (up), 180 = due west (left) —
+// standard math convention, y flipped since SVG y grows downward.
+function polarPoint(cx, cy, r, angleDeg) {
+  const rad = (angleDeg * Math.PI) / 180;
+  return { x: cx + r * Math.cos(rad), y: cy - r * Math.sin(rad) };
+}
+
+// Thermometer gauge — unchanged visual from the original page, just no
+// longer hardcoded: fill height is driven by (value, range, isStaleReading)
+// props instead of module-level state.
+function ThermometerGauge({ value, range, isStaleReading }) {
+  const pct = Math.max(0, Math.min(100,
+    (((value ?? range.min) - range.min) / (range.max - range.min)) * 100
+  ));
+  const color = isStaleReading ? '#9ca3af' : '#dc2626';
+  return (
+    <svg width="70" height="220" viewBox="0 0 70 220">
+      <rect x="25" y="10" width="20" height="160" rx="10" fill="none" stroke="#1f2937" strokeWidth="3" />
+      <circle cx="35" cy="195" r="22" fill="none" stroke="#1f2937" strokeWidth="3" />
+      <circle cx="35" cy="195" r="17" fill={color} />
+      <rect x="30" y={170 - (140 * pct / 100)} width="10" height={140 * pct / 100 + 15} rx="5" fill={color} />
+      {[0, 25, 50, 75, 100].map(tickPct => (
+        <line key={tickPct}
+          x1="46" y1={170 - (140 * tickPct / 100)}
+          x2="52" y2={170 - (140 * tickPct / 100)}
+          stroke="#9ca3af" strokeWidth="1.5" />
+      ))}
+    </svg>
+  );
+}
+
+// Pressure gauge — deliberately NOT a thermometer: a semicircular analog
+// dial with tick marks and a needle sweeping from range.min (left, 180°)
+// through the top (90°) to range.max (right, 0°).
+function PressureGauge({ value, range, isStaleReading }) {
+  const pct   = Math.max(0, Math.min(1, ((value ?? range.min) - range.min) / (range.max - range.min)));
+  const angle = 180 - pct * 180;
+  const color = isStaleReading ? '#9ca3af' : '#dc2626';
+  const cx = 100, cy = 108, rTrack = 84, rNeedle = 76;
+  const arcStart = polarPoint(cx, cy, rTrack, 180);
+  const arcEnd   = polarPoint(cx, cy, rTrack, 0);
+  const needle   = polarPoint(cx, cy, rNeedle, angle);
+  return (
+    <svg width="200" height="120" viewBox="0 0 200 120">
+      {/* Background track */}
+      <path d={`M ${arcStart.x} ${arcStart.y} A ${rTrack} ${rTrack} 0 0 1 ${arcEnd.x} ${arcEnd.y}`}
+        fill="none" stroke="#e5e7eb" strokeWidth="10" strokeLinecap="round" />
+      {/* Tick marks every 25% of range */}
+      {[0, 25, 50, 75, 100].map(tickPct => {
+        const a  = 180 - (tickPct / 100) * 180;
+        const p1 = polarPoint(cx, cy, rTrack + 3, a);
+        const p2 = polarPoint(cx, cy, rTrack - 9, a);
+        return <line key={tickPct} x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} stroke="#9ca3af" strokeWidth="2" />;
+      })}
+      {/* Needle */}
+      <line x1={cx} y1={cy} x2={needle.x} y2={needle.y} stroke={color} strokeWidth="3" strokeLinecap="round" />
+      <circle cx={cx} cy={cy} r="7" fill={color} />
+    </svg>
+  );
+}
+
+// Shared live-reading card — mirrors the original thermometer card exactly
+// (machine name, sensor label, big value+unit, LIVE/STALE badge, "Updated
+// HH:MM:SS IST"), parameterized so both the temperature and pressure cards
+// use the identical layout and only the gauge SVG differs.
+function SensorReadingCard({ machineName, sensorLabel, value, unit, decimals, isStaleReading, lastUpdated, gauge }) {
+  return (
+    <div style={{
+      background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
+      padding: '32px 40px', display: 'flex', alignItems: 'center', gap: 40, flex: 1,
+    }}>
+      <div style={{ flexShrink: 0 }}>{gauge}</div>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 8 }}>
+          {machineName}
+        </div>
+        <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 4 }}>
+          {sensorLabel}
+        </div>
+        <div style={{
+          fontSize: 56, fontWeight: 700, lineHeight: 1,
+          color: isStaleReading ? '#9ca3af' : '#dc2626',
+          marginBottom: 12,
+        }}>
+          {value != null ? value.toFixed(decimals) : '—'}
+          <span style={{ fontSize: 24, fontWeight: 400, marginLeft: 4 }}>{unit}</span>
+        </div>
+
+        {isStaleReading ? (
+          <span style={{
+            background: '#fef3c7', color: '#92400e', padding: '4px 12px',
+            borderRadius: 6, fontSize: 12, fontWeight: 600,
+          }}>STALE</span>
+        ) : value != null ? (
+          <span style={{
+            background: '#dcfce7', color: '#166534', padding: '4px 12px',
+            borderRadius: 6, fontSize: 12, fontWeight: 600,
+          }}>● LIVE</span>
+        ) : null}
+
+        <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 10 }}>
+          {lastUpdated ? `Updated ${toIST(lastUpdated)} IST` : 'No data yet'}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TemperatureAndPressurePage({ token, onLogout }) {
+  // Fleet-wide live tags — same endpoint /machines/live already uses to
+  // group readings by machine_id. Eligible machines (selector options) and
+  // the selected machine's live values are both derived from this one poll.
+  const [liveByMachine, setLiveByMachine] = useState([]);
+  const [selectedMachineId, setSelectedMachineId] = useState(null);
+
+  const [hours, setHours]           = useState(1);
+  const [histData, setHistData]     = useState(null);
+  const [histLoading, setHistLoading] = useState(true);
 
   const [tempView, setTempView]     = useState('chart'); // 'chart' | 'table'
   const [logDate, setLogDate]       = useState(() => {
@@ -1575,295 +1714,352 @@ function TemperaturePage({ token, onLogout }) {
     if (istHour < 9) d.setDate(d.getDate() - 1);
     return d.toISOString().slice(0, 10);
   });
-  const [logData, setLogData]       = useState(null);
+  const [logRows, setLogRows]       = useState([]);
   const [logLoading, setLogLoading] = useState(false);
 
+  const TIME_WINDOWS = [1, 3, 6, 12, 24];
+
+  // Poll /machines/live for the selector list + selected machine's live tags.
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
-
-    const fetchCurrent = () => {
-      apiFetch('/sensors/temperature/current', token)
-        .then(data => { if (!cancelled) setCurrent(data); })
+    const fetchLive = () => {
+      apiFetch('/machines/live', token)
+        .then(data => { if (!cancelled) setLiveByMachine(Array.isArray(data) ? data : []); })
         .catch(() => {});
     };
-    fetchCurrent();
-    const id = setInterval(fetchCurrent, 10_000);
-
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
+    fetchLive();
+    const id = setInterval(fetchLive, 10_000);
+    return () => { cancelled = true; clearInterval(id); };
   }, [token]);
 
+  // Machines with at least one of (temperature, pressure) — no hardcoded IDs.
+  const eligibleMachines = liveByMachine.filter(
+    m => m.tags?.temperature != null || m.tags?.pressure != null
+  );
+
+  // Default/keep selection valid as the eligible list changes.
   useEffect(() => {
-    if (!token) return;
+    if (eligibleMachines.length === 0) return;
+    const stillEligible = eligibleMachines.some(m => m.machine_id === selectedMachineId);
+    if (selectedMachineId == null || !stillEligible) {
+      setSelectedMachineId(eligibleMachines[0].machine_id);
+    }
+    // eligibleMachines is derived fresh every render; comparing by id above
+    // keeps this from looping once a valid selection is set.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveByMachine, selectedMachineId]);
+
+  const selectedMachine = liveByMachine.find(m => m.machine_id === selectedMachineId);
+  const hasTemp     = selectedMachine?.tags?.temperature != null;
+  const hasPressure = selectedMachine?.tags?.pressure != null;
+  const isStaleReading = isStale(selectedMachine?.last_updated);
+
+  // History — generic /machines/{id}/history, same endpoint JetDetail uses,
+  // now merging tags across every component instance the machine owns.
+  useEffect(() => {
+    if (!token || selectedMachineId == null) return;
     let cancelled = false;
-    setLoading(true);
-
-    apiFetch(`/sensors/temperature/history?hours=${hours}`, token)
-      .then(data => {
-        if (!cancelled) {
-          setHistory(Array.isArray(data) ? data : []);
-          setLoading(false);
-        }
-      })
-      .catch(() => { if (!cancelled) setLoading(false); });
-
+    setHistLoading(true);
+    apiFetch(`/machines/${selectedMachineId}/history?hours=${hours}`, token)
+      .then(data => { if (!cancelled) { setHistData(data); setHistLoading(false); } })
+      .catch(() => { if (!cancelled) setHistLoading(false); });
     return () => { cancelled = true; };
-  }, [token, hours]);
+  }, [token, selectedMachineId, hours]);
 
+  const histRows = histData?.data || [];
+  const tempChartData     = histRows.map(d => ({ time: fmtIST24(d.bucket), value: d.tags?.temperature }));
+  const pressureChartData = histRows.map(d => ({ time: fmtIST24(d.bucket), value: d.tags?.pressure }));
+  // Cap displayed x-axis labels at ~8 regardless of window length, per the
+  // "reduce tick count rather than shrink font" requirement.
+  const tickInterval = Math.max(0, Math.ceil(histRows.length / 8) - 1);
+
+  // Table View — combined 5-min-avg log for the selected machine's
+  // operational day, one column per sensor the machine actually has.
+  // Reuses the SAME generic /machines/{id}/sensor-log?tag=... endpoint for
+  // whichever tags are present — not a second hardcoded endpoint.
   useEffect(() => {
-    if (!token || tempView !== 'table') return;
+    if (!token || tempView !== 'table' || selectedMachineId == null) return;
+    if (!hasTemp && !hasPressure) { setLogRows([]); return; }
     let cancelled = false;
     setLogLoading(true);
 
-    apiFetch(`/sensors/temperature/log?date=${logDate}`, token)
-      .then(data => { if (!cancelled) { setLogData(data); setLogLoading(false); } })
+    const calls = [];
+    if (hasTemp) calls.push(
+      apiFetch(`/machines/${selectedMachineId}/sensor-log?tag=temperature&date=${logDate}`, token)
+        .then(data => ({ tag: 'temperature', data }))
+    );
+    if (hasPressure) calls.push(
+      apiFetch(`/machines/${selectedMachineId}/sensor-log?tag=pressure&date=${logDate}`, token)
+        .then(data => ({ tag: 'pressure', data }))
+    );
+
+    Promise.all(calls)
+      .then(results => {
+        if (cancelled) return;
+        const merged = {};
+        results.forEach(({ tag, data }) => {
+          (data.readings || []).forEach(r => {
+            if (!merged[r.timestamp]) merged[r.timestamp] = { time: r.time, timestamp: r.timestamp };
+            merged[r.timestamp][tag] = r.avg_value;
+          });
+        });
+        setLogRows(Object.values(merged).sort((a, b) => a.timestamp.localeCompare(b.timestamp)));
+        setLogLoading(false);
+      })
       .catch(() => { if (!cancelled) setLogLoading(false); });
 
     return () => { cancelled = true; };
-  }, [token, tempView, logDate]);
+  }, [token, tempView, logDate, selectedMachineId, hasTemp, hasPressure]);
 
-  function downloadTemperaturePdf() {
-    const url = `/api/sensors/temperature/log/pdf?date=${logDate}`;
-    // Fetch with auth header, then trigger browser download
+  function downloadSensorPdf(tag) {
+    const url = `/api/machines/${selectedMachineId}/sensor-log/pdf?tag=${tag}&date=${logDate}`;
     fetch(url, { headers: { Authorization: `Bearer ${token}` } })
       .then(res => res.blob())
       .then(blob => {
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = `mevion-jet27-temperature-${logDate}.pdf`;
+        const slug = (selectedMachine?.machine_name || 'machine').toLowerCase().replace(/\s+/g, '-');
+        a.download = `mevion-${slug}-${tag}-${logDate}.pdf`;
         a.click();
       });
   }
 
-  const chartData = history.map(h => ({
-    time: new Date(h.timestamp.endsWith('Z') ? h.timestamp : h.timestamp + 'Z')
-            .toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true }),
-    value: h.value,
-  }));
-
-  const isStaleReading = current?.timestamp &&
-    (Date.now() - new Date(current.timestamp.endsWith('Z') ? current.timestamp : current.timestamp + 'Z').getTime()) > 120_000;
-
-  const TIME_WINDOWS = [1, 3, 6, 12, 24];
-
-  // Thermometer fill calculation — scale 0-120°C to 0-100% fill height
-  // (dyebath process range, adjust min/max if your process range differs)
-  const THERMO_MIN = 0;
-  const THERMO_MAX = 120;
-  const tempValue  = current?.value ?? 0;
-  const fillPct    = Math.max(0, Math.min(100,
-    ((tempValue - THERMO_MIN) / (THERMO_MAX - THERMO_MIN)) * 100
-  ));
-
   return (
-    <div style={{ padding: '24px 32px', maxWidth: 960, margin: '0 auto' }}>
+    <div style={{ padding: '24px 32px', maxWidth: 1200, margin: '0 auto' }}>
 
-      <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 24, color: '#1f2937' }}>
-        Dyebath Temperature Monitor
+      <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 16, color: '#1f2937' }}>
+        Temperature & Pressure Monitor
       </h2>
 
-      {/* Thermometer + current reading card */}
-      <div style={{
-        background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
-        padding: '32px 40px', marginBottom: 24, display: 'flex',
-        alignItems: 'center', gap: 40,
-      }}>
-        {/* SVG Thermometer */}
-        <div style={{ flexShrink: 0 }}>
-          <svg width="70" height="220" viewBox="0 0 70 220">
-            {/* Outer tube outline */}
-            <rect x="25" y="10" width="20" height="160" rx="10"
-              fill="none" stroke="#1f2937" strokeWidth="3" />
-            <circle cx="35" cy="195" r="22"
-              fill="none" stroke="#1f2937" strokeWidth="3" />
-
-            {/* Mercury fill — bulb (always full) */}
-            <circle cx="35" cy="195" r="17"
-              fill={isStaleReading ? '#9ca3af' : '#dc2626'} />
-
-            {/* Mercury fill — tube, height driven by fillPct */}
-            <rect
-              x="30"
-              y={170 - (140 * fillPct / 100)}
-              width="10"
-              height={140 * fillPct / 100 + 15}
-              rx="5"
-              fill={isStaleReading ? '#9ca3af' : '#dc2626'}
-            />
-
-            {/* Tick marks */}
-            {[0, 25, 50, 75, 100].map(pct => (
-              <line key={pct}
-                x1="46" y1={170 - (140 * pct / 100)}
-                x2="52" y2={170 - (140 * pct / 100)}
-                stroke="#9ca3af" strokeWidth="1.5" />
+      {/* Machine selector — lists every machine with temperature and/or pressure */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 20 }}>
+        <span style={{ fontSize: 13, color: '#6b7280' }}>Machine:</span>
+        {eligibleMachines.length === 0 ? (
+          <span style={{ fontSize: 13, color: '#9ca3af' }}>No machines with temperature/pressure sensors yet.</span>
+        ) : (
+          <select
+            value={selectedMachineId ?? ''}
+            onChange={e => setSelectedMachineId(parseInt(e.target.value))}
+            style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #e5e7eb',
+              fontSize: 13, color: '#1f2937', fontWeight: 600 }}
+          >
+            {eligibleMachines.map(m => (
+              <option key={m.machine_id} value={m.machine_id}>{m.machine_name}</option>
             ))}
-          </svg>
-        </div>
-
-        {/* Reading + status */}
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 8 }}>
-            Jet 27
-          </div>
-          <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 4 }}>
-            Current Temperature
-          </div>
-          <div style={{
-            fontSize: 56, fontWeight: 700, lineHeight: 1,
-            color: isStaleReading ? '#9ca3af' : '#dc2626',
-            marginBottom: 12,
-          }}>
-            {current?.value != null ? current.value.toFixed(0) : '—'}
-            <span style={{ fontSize: 24, fontWeight: 400, marginLeft: 4 }}>°C</span>
-          </div>
-
-          {isStaleReading ? (
-            <span style={{
-              background: '#fef3c7', color: '#92400e', padding: '4px 12px',
-              borderRadius: 6, fontSize: 12, fontWeight: 600,
-            }}>STALE</span>
-          ) : current?.value != null ? (
-            <span style={{
-              background: '#dcfce7', color: '#166534', padding: '4px 12px',
-              borderRadius: 6, fontSize: 12, fontWeight: 600,
-            }}>● LIVE</span>
-          ) : null}
-
-          <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 10 }}>
-            {current?.timestamp
-              ? `Updated ${new Date(current.timestamp.endsWith('Z') ? current.timestamp : current.timestamp + 'Z')
-                  .toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second:'2-digit', hour12: true })} IST`
-              : 'No data yet'}
-          </div>
-        </div>
+          </select>
+        )}
       </div>
 
-      {/* Time window selector */}
-      <div style={{ display: 'flex', gap: 4, marginBottom: 16 }}>
-        {TIME_WINDOWS.map(h => (
-          <button key={h} onClick={() => setHours(h)} style={{
-            padding: '5px 14px', borderRadius: 6, fontSize: 13,
-            background: hours === h ? C.red : 'transparent',
-            color:      hours === h ? '#fff' : '#6b7280',
-            border:     `1px solid ${hours === h ? C.red : '#e5e7eb'}`,
-            cursor: 'pointer', fontWeight: hours === h ? 600 : 400,
-          }}>{h}h</button>
-        ))}
-      </div>
-
-      {/* View toggle */}
-      <div style={{ display: 'flex', gap: 4, marginTop: 16, marginBottom: 12 }}>
-        {[['chart','Chart View'],['table','Table View']].map(([val,label]) => (
-          <button key={val} onClick={() => setTempView(val)} style={{
-            padding: '6px 16px', borderRadius: 6, fontSize: 13,
-            background: tempView === val ? C.red : 'transparent',
-            color:      tempView === val ? '#fff' : '#6b7280',
-            border:     `1px solid ${tempView === val ? C.red : '#e5e7eb'}`,
-            cursor: 'pointer', fontWeight: tempView === val ? 600 : 400,
-          }}>{label}</button>
-        ))}
-      </div>
-
-      {/* History chart — area style matching reference image */}
-      {tempView === 'chart' && (
-        <div style={{
-          background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
-          padding: 24,
-        }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 16 }}>
-            Temperature Trend — last {hours}h
-          </div>
-          {loading ? (
-            <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
-          ) : chartData.length === 0 ? (
-            <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
-              No temperature data for this period.
-            </div>
-          ) : (
-            <ResponsiveContainer width="100%" height={260}>
-              <AreaChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
-                <defs>
-                  <linearGradient id="tempGradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#dc2626" stopOpacity={0.35}/>
-                    <stop offset="95%" stopColor="#dc2626" stopOpacity={0.02}/>
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
-                <XAxis dataKey="time" tick={{ fill: '#9ca3af', fontSize: 11 }} />
-                <YAxis tick={{ fill: '#9ca3af', fontSize: 11 }}
-                  tickFormatter={v => `${Math.round(v)}°`} domain={['dataMin - 3', 'dataMax + 3']} />
-                <Tooltip
-                  contentStyle={{ background: '#fff', border: '1px solid #e5e7eb',
-                    borderRadius: 8, fontSize: 12 }}
-                  formatter={(val) => [`${val}°C`, 'Temperature']}
-                />
-                <Area type="monotone" dataKey="value" stroke="#dc2626"
-                  strokeWidth={2.5} fill="url(#tempGradient)" />
-              </AreaChart>
-            </ResponsiveContainer>
-          )}
-        </div>
-      )}
-
-      {tempView === 'table' && (
-        <div style={{
-          background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
-          padding: 24, marginTop: 12,
-        }}>
-          <div style={{
-            display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center',
-            justifyContent: 'space-between', marginBottom: 16,
-          }}>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <span style={{ fontSize: 13, color: '#6b7280' }}>Operational day:</span>
-              <input type="date" value={logDate} onChange={e => setLogDate(e.target.value)}
-                style={{ padding: '5px 10px', borderRadius: 6, border: '1px solid #e5e7eb',
-                  fontSize: 13, color: '#1f2937' }} />
-            </div>
-            <button onClick={downloadTemperaturePdf} style={{
-              padding: '6px 16px', borderRadius: 6, fontSize: 13, fontWeight: 600,
-              background: C.red, color: '#fff', border: 'none', cursor: 'pointer',
-            }}>
-              Download PDF
-            </button>
+      {selectedMachine && (
+        <>
+          {/* Live reading cards — side by side; only sensors present on this
+              machine render a card, so a single-sensor machine gets one
+              full-width card rather than an empty placeholder. */}
+          <div style={{ display: 'flex', gap: 24, marginBottom: 24 }}>
+            {hasTemp && (
+              <SensorReadingCard
+                machineName={selectedMachine.machine_name}
+                sensorLabel="Current Temperature"
+                value={selectedMachine.tags.temperature}
+                unit="°C"
+                decimals={0}
+                isStaleReading={isStaleReading}
+                lastUpdated={selectedMachine.last_updated}
+                gauge={<ThermometerGauge value={selectedMachine.tags.temperature} range={TEMP_RANGE} isStaleReading={isStaleReading} />}
+              />
+            )}
+            {hasPressure && (
+              <SensorReadingCard
+                machineName={selectedMachine.machine_name}
+                sensorLabel="Current Pressure"
+                value={selectedMachine.tags.pressure}
+                unit="kg/cm²"
+                decimals={2}
+                isStaleReading={isStaleReading}
+                lastUpdated={selectedMachine.last_updated}
+                gauge={<PressureGauge value={selectedMachine.tags.pressure} range={PRESSURE_RANGE} isStaleReading={isStaleReading} />}
+              />
+            )}
           </div>
 
-          {logLoading ? (
-            <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
-          ) : !logData?.readings?.length ? (
-            <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
-              No readings for this operational day.
-            </div>
-          ) : (
-            <div style={{ overflowX: 'auto', maxHeight: 500, overflowY: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-                <thead>
-                  <tr style={{ position: 'sticky', top: 0, background: '#fff' }}>
-                    <th style={{ padding: '8px 12px', textAlign: 'left', color: '#6b7280',
-                      borderBottom: '1px solid #e5e7eb' }}>Time</th>
-                    <th style={{ padding: '8px 12px', textAlign: 'right', color: '#6b7280',
-                      borderBottom: '1px solid #e5e7eb' }}>Avg °C</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {logData.readings.map((r, i) => (
-                    <tr key={r.timestamp} style={{
-                      background: i % 2 === 0 ? 'transparent' : '#f9fafb',
-                    }}>
-                      <td style={{ padding: '6px 12px', color: '#1f2937' }}>{r.time}</td>
-                      <td style={{ padding: '6px 12px', textAlign: 'right',
-                        color: '#dc2626', fontWeight: 600 }}>{r.avg_temp}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+          {/* Time window selector — controls both trend charts */}
+          <div style={{ display: 'flex', gap: 4, marginBottom: 16 }}>
+            {TIME_WINDOWS.map(h => (
+              <button key={h} onClick={() => setHours(h)} style={{
+                padding: '5px 14px', borderRadius: 6, fontSize: 13,
+                background: hours === h ? C.red : 'transparent',
+                color:      hours === h ? '#fff' : '#6b7280',
+                border:     `1px solid ${hours === h ? C.red : '#e5e7eb'}`,
+                cursor: 'pointer', fontWeight: hours === h ? 600 : 400,
+              }}>{h}h</button>
+            ))}
+          </div>
+
+          {/* View toggle — applies to both sensors at once */}
+          <div style={{ display: 'flex', gap: 4, marginBottom: 12 }}>
+            {[['chart','Chart View'],['table','Table View']].map(([val,label]) => (
+              <button key={val} onClick={() => setTempView(val)} style={{
+                padding: '6px 16px', borderRadius: 6, fontSize: 13,
+                background: tempView === val ? C.red : 'transparent',
+                color:      tempView === val ? '#fff' : '#6b7280',
+                border:     `1px solid ${tempView === val ? C.red : '#e5e7eb'}`,
+                cursor: 'pointer', fontWeight: tempView === val ? 600 : 400,
+              }}>{label}</button>
+            ))}
+          </div>
+
+          {/* Trend charts — side by side; hard requirement, not a toggle */}
+          {tempView === 'chart' && (
+            <div style={{ display: 'flex', gap: 24 }}>
+              {hasTemp && (
+                <div style={{ flex: 1, background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16, padding: 24 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 16 }}>
+                    Temperature Trend — last {hours}h
+                  </div>
+                  {histLoading ? (
+                    <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
+                  ) : tempChartData.every(d => d.value == null) ? (
+                    <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
+                      No temperature data for this period.
+                    </div>
+                  ) : (
+                    <ResponsiveContainer width="100%" height={260}>
+                      <AreaChart data={tempChartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                        <defs>
+                          <linearGradient id="tempGradient" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#dc2626" stopOpacity={0.35}/>
+                            <stop offset="95%" stopColor="#dc2626" stopOpacity={0.02}/>
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
+                        <XAxis dataKey="time" tick={{ fill: '#9ca3af', fontSize: 11 }} interval={tickInterval} />
+                        <YAxis tick={{ fill: '#9ca3af', fontSize: 11 }}
+                          tickFormatter={v => `${Math.round(v)}°`} domain={['dataMin - 3', 'dataMax + 3']} />
+                        <Tooltip
+                          contentStyle={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, fontSize: 12 }}
+                          formatter={(val) => [`${val}°C`, 'Temperature']}
+                        />
+                        <Area type="monotone" dataKey="value" stroke="#dc2626"
+                          strokeWidth={2.5} fill="url(#tempGradient)" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  )}
+                </div>
+              )}
+              {hasPressure && (
+                <div style={{ flex: 1, background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16, padding: 24 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 16 }}>
+                    Pressure Trend — last {hours}h
+                  </div>
+                  {histLoading ? (
+                    <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
+                  ) : pressureChartData.every(d => d.value == null) ? (
+                    <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
+                      No pressure data for this period.
+                    </div>
+                  ) : (
+                    <ResponsiveContainer width="100%" height={260}>
+                      <AreaChart data={pressureChartData} margin={{ top: 4, right: 8, left: 0, bottom: 4 }}>
+                        <defs>
+                          <linearGradient id="pressureGradient" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#dc2626" stopOpacity={0.35}/>
+                            <stop offset="95%" stopColor="#dc2626" stopOpacity={0.02}/>
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" vertical={false} />
+                        <XAxis dataKey="time" tick={{ fill: '#9ca3af', fontSize: 11 }} interval={tickInterval} />
+                        <YAxis tick={{ fill: '#9ca3af', fontSize: 11 }}
+                          tickFormatter={v => `${Math.round(v * 100) / 100}`} domain={['dataMin - 0.2', 'dataMax + 0.2']} />
+                        <Tooltip
+                          contentStyle={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, fontSize: 12 }}
+                          formatter={(val) => [`${val} kg/cm²`, 'Pressure']}
+                        />
+                        <Area type="monotone" dataKey="value" stroke="#dc2626"
+                          strokeWidth={2.5} fill="url(#pressureGradient)" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  )}
+                </div>
+              )}
             </div>
           )}
-        </div>
+
+          {/* Table View — one combined table, columns for whichever sensors exist */}
+          {tempView === 'table' && (
+            <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16, padding: 24 }}>
+              <div style={{
+                display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center',
+                justifyContent: 'space-between', marginBottom: 16,
+              }}>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <span style={{ fontSize: 13, color: '#6b7280' }}>Operational day:</span>
+                  <input type="date" value={logDate} onChange={e => setLogDate(e.target.value)}
+                    style={{ padding: '5px 10px', borderRadius: 6, border: '1px solid #e5e7eb',
+                      fontSize: 13, color: '#1f2937' }} />
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {hasTemp && (
+                    <button onClick={() => downloadSensorPdf('temperature')} style={{
+                      padding: '6px 16px', borderRadius: 6, fontSize: 13, fontWeight: 600,
+                      background: C.red, color: '#fff', border: 'none', cursor: 'pointer',
+                    }}>Download Temperature PDF</button>
+                  )}
+                  {hasPressure && (
+                    <button onClick={() => downloadSensorPdf('pressure')} style={{
+                      padding: '6px 16px', borderRadius: 6, fontSize: 13, fontWeight: 600,
+                      background: C.red, color: '#fff', border: 'none', cursor: 'pointer',
+                    }}>Download Pressure PDF</button>
+                  )}
+                </div>
+              </div>
+
+              {logLoading ? (
+                <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
+              ) : logRows.length === 0 ? (
+                <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
+                  No readings for this operational day.
+                </div>
+              ) : (
+                <div style={{ overflowX: 'auto', maxHeight: 500, overflowY: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                    <thead>
+                      <tr style={{ position: 'sticky', top: 0, background: '#fff' }}>
+                        <th style={{ padding: '8px 12px', textAlign: 'left', color: '#6b7280',
+                          borderBottom: '1px solid #e5e7eb' }}>Time</th>
+                        {hasTemp && (
+                          <th style={{ padding: '8px 12px', textAlign: 'right', color: '#6b7280',
+                            borderBottom: '1px solid #e5e7eb' }}>Avg °C</th>
+                        )}
+                        {hasPressure && (
+                          <th style={{ padding: '8px 12px', textAlign: 'right', color: '#6b7280',
+                            borderBottom: '1px solid #e5e7eb' }}>Avg kg/cm²</th>
+                        )}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {logRows.map((r, i) => (
+                        <tr key={r.timestamp} style={{ background: i % 2 === 0 ? 'transparent' : '#f9fafb' }}>
+                          <td style={{ padding: '6px 12px', color: '#1f2937' }}>{r.time}</td>
+                          {hasTemp && (
+                            <td style={{ padding: '6px 12px', textAlign: 'right', color: '#dc2626', fontWeight: 600 }}>
+                              {r.temperature ?? '—'}
+                            </td>
+                          )}
+                          {hasPressure && (
+                            <td style={{ padding: '6px 12px', textAlign: 'right', color: '#dc2626', fontWeight: 600 }}>
+                              {r.pressure ?? '—'}
+                            </td>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+        </>
       )}
     </div>
   );

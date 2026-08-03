@@ -20,6 +20,12 @@
 #       Long-form SQL (one row per bucket + tag_key) followed by Python pivot.
 #       The pivot produces {"bucket": ..., "tags": {"frequency": 30.5, ...}}
 #       per time step — symmetric with the live endpoint.  No hardcoded tag IDs.
+#       Merges tags across every component instance owned by the machine.
+#
+#   GET /machines/{machine_id}/sensor-log, /machines/{machine_id}/sensor-log/pdf
+#       5-minute average log (and PDF export) for one (machine_id, tag) pair
+#       over one operational day (09:00 IST -> 09:00 IST next day). Generic —
+#       works for any tag key any machine has (temperature, pressure, ...).
 #
 # Write endpoint (POST /data) stays in data_router.py — not touched here.
 
@@ -306,36 +312,42 @@ def get_history(
         hours  — window length in hours (1–24, default 1).
 
     Ownership check:
-        machine_component_instance is queried for a row matching both machine_id
-        and company_id.  A valid machine_id belonging to a different tenant
-        returns 404, not leaking the fact that the ID exists.
+        machine is queried for a row matching both machine_id and company_id.
+        A valid machine_id belonging to a different tenant returns 404, not
+        leaking the fact that the ID exists.
 
     Phase 5c: replace buildHistory() in App.jsx with a fetch to this endpoint.
+
+    MULTI-COMPONENT NOTE (2026-08-04): A machine can own more than one
+    component_instance — e.g. Jet 27 has a Reel Motor (VFD tags), a
+    temperature sensor, and a pressure sensor, all sharing machine_id=14.
+    The query below joins by mci.machine_id so tags from every component
+    instance under this machine are merged into the same bucket/tag_key
+    result set — symmetric with how _get_latest_rows()/_pivot_rows() already
+    merge multi-component tags for /machines/live. Previously this endpoint
+    resolved machine_id -> a single arbitrary component_instance_id via
+    fetchone(), which silently dropped every tag not on that one component.
     """
-    # --- Resolve machine_id → component_instance_id (ownership check included) ---
-    ci_row = db.execute(
-        text(
-            "SELECT id FROM machine_component_instance "
-            "WHERE machine_id = :machine_id AND company_id = :company_id"
-        ),
+    # --- Ownership check: does this machine belong to the tenant? ---
+    machine_row = db.execute(
+        text("SELECT id FROM machine WHERE id = :machine_id AND company_id = :company_id"),
         {"machine_id": machine_id, "company_id": current_user["company_id"]},
     ).fetchone()
 
-    if ci_row is None:
+    if machine_row is None:
         raise HTTPException(
             status_code=404,
             detail="Machine {} not found.".format(machine_id),
         )
 
-    cid = ci_row[0]   # the component_instance_id stored in telemetry_data
-
     # --- Time window and bucket size ---
     since = datetime.utcnow() - timedelta(hours=hours)
     interval = _bucket_interval(hours)
 
-    # --- Long-form query: one row per (bucket, tag_key) ---
-    # JOIN to tag_definition gives the slug key so results are keyed by contract
-    # slug ("frequency", "power", …) rather than integer tag_definition_id.
+    # --- Long-form query: one row per (bucket, tag_key), across ALL of this
+    # machine's component instances. JOIN to tag_definition gives the slug key
+    # so results are keyed by contract slug ("frequency", "temperature",
+    # "pressure", …) rather than integer tag_definition_id.
     # The interval string is chosen from a fixed lookup — not user-supplied —
     # so embedding it directly in the SQL text is safe.
     sql = text("""
@@ -344,17 +356,19 @@ def get_history(
             tdef.key                                AS tag_key,
             AVG(td.value_num)                       AS avg_value
         FROM telemetry_data td
+        JOIN machine_component_instance mci
+          ON mci.id = td.component_instance_id
         JOIN tag_definition tdef
           ON tdef.id = td.tag_definition_id
-        WHERE td.component_instance_id = :cid
-          AND td.company_id             = :company_id
-          AND td.timestamp             >= :since
+        WHERE mci.machine_id  = :machine_id
+          AND td.company_id   = :company_id
+          AND td.timestamp   >= :since
         GROUP BY bucket, tdef.key
         ORDER BY bucket ASC, tdef.key
     """.format(interval=interval))
 
     rows = db.execute(sql, {
-        "cid":        cid,
+        "machine_id": machine_id,
         "company_id": current_user["company_id"],
         "since":      since,
     }).mappings().all()
@@ -385,85 +399,18 @@ def get_history(
 
 
 # ---------------------------------------------------------------------------
-# GET /sensors/temperature/current, /sensors/temperature/history
+# GET /machines/{machine_id}/sensor-log, /machines/{machine_id}/sensor-log/pdf
 #
-# The Electrosil Fx-438 dyebath temperature sensor is a standalone sensor
-# device, not a VFD-driven machine component — Jet 27 (machine_id=14) now has
-# TWO component instances (Reel Motor id=15, Temp Sensor id=29), so the
-# existing /machines/{id}/history endpoint (which assumes one component per
-# machine and grabs the first match via fetchone()) can't be reused cleanly.
-# These endpoints go straight to component_instance_id=29 / tag_definition_id=8
-# instead — hardcoded because this is currently the only such sensor.
-# ---------------------------------------------------------------------------
-
-_TEMPERATURE_TAG_ID       = 8
-_TEMPERATURE_COMPONENT_ID = 29
-
-
-@router.get("/sensors/temperature/current")
-def get_temperature_current(
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_tenant_db),
-):
-    """Latest temperature reading from the Electrosil Fx-438 dyebath sensor."""
-    company_id = current_user["company_id"]
-    row = db.execute(text("""
-        SELECT td.value_num, td.timestamp
-        FROM telemetry_data td
-        WHERE td.tag_definition_id     = :tag_id
-          AND td.company_id            = :company_id
-          AND td.component_instance_id = :component_id
-        ORDER BY td.timestamp DESC
-        LIMIT 1
-    """), {
-        "tag_id":       _TEMPERATURE_TAG_ID,
-        "company_id":   company_id,
-        "component_id": _TEMPERATURE_COMPONENT_ID,
-    }).mappings().first()
-
-    if not row:
-        return {"value": None, "timestamp": None}
-    return {"value": float(row["value_num"]), "timestamp": row["timestamp"].isoformat()}
-
-
-@router.get("/sensors/temperature/history")
-def get_temperature_history(
-    hours: int = Query(default=1, ge=1, le=168),
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_tenant_db),
-):
-    """Temperature history for the last N hours (1–168) from the dyebath sensor."""
-    company_id = current_user["company_id"]
-    since = datetime.utcnow() - timedelta(hours=hours)
-
-    rows = db.execute(text("""
-        SELECT td.value_num, td.timestamp
-        FROM telemetry_data td
-        WHERE td.tag_definition_id     = :tag_id
-          AND td.company_id            = :company_id
-          AND td.component_instance_id = :component_id
-          AND td.timestamp             >= :since
-        ORDER BY td.timestamp ASC
-    """), {
-        "tag_id":       _TEMPERATURE_TAG_ID,
-        "company_id":   company_id,
-        "component_id": _TEMPERATURE_COMPONENT_ID,
-        "since":        since,
-    }).mappings().all()
-
-    return [
-        {"value": float(r["value_num"]), "timestamp": r["timestamp"].isoformat()}
-        for r in rows
-    ]
-
-
-# ---------------------------------------------------------------------------
-# GET /sensors/temperature/log, /sensors/temperature/log/pdf
+# 5-minute average log for one (machine, tag) pair over an operational day
+# (09:00 IST -> 09:00 IST next day), plus a downloadable PDF rendering.
 #
-# 5-minute average temperature log for one operational day (09:00 IST ->
-# 09:00 IST next day), plus a downloadable PDF rendering of the same data.
-# Same hardcoded sensor identity as /current and /history above — single
-# sensor, single tenant today; multi-sensor support is a future enhancement.
+# GENERIC BY DESIGN (2026-08-04): these replace the earlier hardcoded
+# /sensors/temperature/log(/pdf) endpoints, which only ever worked for one
+# sensor (component_instance_id=29, tag_definition_id=8). As more machines
+# gain temperature/pressure/other sensors, a per-sensor hardcoded endpoint
+# doesn't scale — these are parameterized by machine_id + tag key (the same
+# slug convention /machines/live and /machines/{id}/history already use), so
+# any (machine, tag) combination works without new backend code.
 # ---------------------------------------------------------------------------
 
 _IST_OFFSET = timedelta(hours=5, minutes=30)
@@ -477,75 +424,113 @@ def _op_day_bounds_utc(op_date: date_type) -> tuple[datetime, datetime]:
     return start_utc, end_utc
 
 
-def _fetch_temperature_log_rows(db: Session, company_id: int, op_date: date_type):
-    """Shared query — 5-minute average temperature buckets for one operational day."""
+def _fetch_sensor_log_rows(db: Session, company_id: int, machine_id: int,
+                            tag_key: str, op_date: date_type):
+    """Shared query — 5-minute average buckets for one (machine, tag) over one operational day.
+
+    Joins through machine_component_instance by machine_id (not a single
+    resolved component_instance_id) so it works regardless of which physical
+    component on the machine produces this tag — symmetric with the
+    multi-component fix applied to /machines/{id}/history.
+    """
     start_utc, end_utc = _op_day_bounds_utc(op_date)
 
     sql = text("""
         SELECT
-            time_bucket('5 minutes', timestamp) AS bucket,
-            AVG(value_num) AS avg_temp
-        FROM telemetry_data
-        WHERE tag_definition_id     = :tag_id
-          AND component_instance_id = :component_id
-          AND company_id            = :company_id
-          AND timestamp             >= :start_utc
-          AND timestamp             <  :end_utc
+            time_bucket('5 minutes', td.timestamp) AS bucket,
+            AVG(td.value_num) AS avg_value
+        FROM telemetry_data td
+        JOIN machine_component_instance mci ON mci.id = td.component_instance_id
+        JOIN tag_definition tdef            ON tdef.id = td.tag_definition_id
+        WHERE mci.machine_id  = :machine_id
+          AND tdef.key        = :tag_key
+          AND td.company_id   = :company_id
+          AND td.timestamp   >= :start_utc
+          AND td.timestamp    <  :end_utc
         GROUP BY bucket
         ORDER BY bucket
     """)
 
     return db.execute(sql, {
-        "tag_id":       _TEMPERATURE_TAG_ID,
-        "component_id": _TEMPERATURE_COMPONENT_ID,
-        "company_id":   company_id,
-        "start_utc":    start_utc,
-        "end_utc":      end_utc,
+        "machine_id": machine_id,
+        "tag_key":    tag_key,
+        "company_id": company_id,
+        "start_utc":  start_utc,
+        "end_utc":    end_utc,
     }).mappings().fetchall()
 
 
-@router.get("/sensors/temperature/log")
-def get_temperature_log(
+def _get_machine_name(db: Session, company_id: int, machine_id: int) -> str | None:
+    row = db.execute(
+        text("SELECT name FROM machine WHERE id = :machine_id AND company_id = :company_id"),
+        {"machine_id": machine_id, "company_id": company_id},
+    ).mappings().first()
+    return row["name"] if row else None
+
+
+def _get_tag_meta(db: Session, company_id: int, tag_key: str):
+    """Return {"name": ..., "unit": ...} for a tag_definition.key, or None."""
+    row = db.execute(
+        text("SELECT name, unit FROM tag_definition WHERE key = :tag_key AND company_id = :company_id"),
+        {"tag_key": tag_key, "company_id": company_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+@router.get("/machines/{machine_id}/sensor-log")
+def get_machine_sensor_log(
+    machine_id: int,
+    tag: str = Query(..., description="Tag key, e.g. 'temperature' or 'pressure'"),
     date: str = Query(..., description="Operational day start date YYYY-MM-DD (IST)"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_tenant_db),
 ):
     """
-    5-minute average temperature readings for one operational day
-    (09:00 IST -> 09:00 IST next day).
+    5-minute average readings for one (machine, tag) pair over one operational
+    day (09:00 IST -> 09:00 IST next day).
     """
     company_id = current_user["company_id"]
+
+    if _get_machine_name(db, company_id, machine_id) is None:
+        raise HTTPException(404, f"Machine {machine_id} not found.")
 
     try:
         op_date = date_type.fromisoformat(date)
     except ValueError:
         raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD.")
 
-    rows = _fetch_temperature_log_rows(db, company_id, op_date)
+    rows = _fetch_sensor_log_rows(db, company_id, machine_id, tag, op_date)
 
     return {
+        "machine_id": machine_id,
+        "tag": tag,
         "date": date,
         "shift_start_ist": "09:00",
         "shift_end_ist": "09:00 (+1 day)",
         "readings": [
             {
-                "time": (r["bucket"] + _IST_OFFSET).strftime("%I:%M %p"),
+                # 24-hour clock — matches the trend chart's axis format.
+                "time": (r["bucket"] + _IST_OFFSET).strftime("%H:%M"),
                 "timestamp": r["bucket"].isoformat(),
-                "avg_temp": round(float(r["avg_temp"]), 1),
+                "avg_value": round(float(r["avg_value"]), 1),
             }
             for r in rows
         ],
     }
 
 
-@router.get("/sensors/temperature/log/pdf")
-def get_temperature_log_pdf(
+@router.get("/machines/{machine_id}/sensor-log/pdf")
+def get_machine_sensor_log_pdf(
+    machine_id: int,
+    tag: str = Query(..., description="Tag key, e.g. 'temperature' or 'pressure'"),
     date: str = Query(..., description="Operational day start date YYYY-MM-DD (IST)"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_tenant_db),
 ):
     """
-    Same data as /sensors/temperature/log, rendered as a downloadable PDF report.
+    Same data as /machines/{machine_id}/sensor-log, rendered as a downloadable
+    PDF report. Title, unit, and filename are all derived from the machine and
+    tag_definition rows — nothing sensor-specific is hardcoded.
     """
     from reportlab.lib.pagesizes import letter
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -555,15 +540,24 @@ def get_temperature_log_pdf(
 
     company_id = current_user["company_id"]
 
+    machine_name = _get_machine_name(db, company_id, machine_id)
+    if machine_name is None:
+        raise HTTPException(404, f"Machine {machine_id} not found.")
+
+    tag_meta = _get_tag_meta(db, company_id, tag)
+    if tag_meta is None:
+        raise HTTPException(404, f"Unknown sensor tag '{tag}'.")
+    tag_name, tag_unit = tag_meta["name"], tag_meta["unit"]
+
     try:
         op_date = date_type.fromisoformat(date)
     except ValueError:
         raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD.")
 
-    rows = _fetch_temperature_log_rows(db, company_id, op_date)
+    rows = _fetch_sensor_log_rows(db, company_id, machine_id, tag, op_date)
 
     if not rows:
-        raise HTTPException(404, "No temperature data for this date.")
+        raise HTTPException(404, "No data for this date.")
 
     # --- Build PDF in memory ---
     buffer = io.BytesIO()
@@ -584,21 +578,21 @@ def get_temperature_log_pdf(
     )
 
     story = []
-    story.append(Paragraph("Mevion — Dyebath Temperature Log", title_style))
+    story.append(Paragraph(f"Mevion — {tag_name} Log", title_style))
     story.append(Spacer(1, 4))
     story.append(Paragraph(
-        f"Jet 27 · Electrosil Fx-438 · Operational day {op_date.strftime('%d %b %Y')} "
+        f"{machine_name} · Operational day {op_date.strftime('%d %b %Y')} "
         f"(09:00 to 09:00 next day, IST)",
         subtitle_style
     ))
     story.append(Spacer(1, 16))
 
     # Summary stats
-    temps = [float(r["avg_temp"]) for r in rows]
+    values = [float(r["avg_value"]) for r in rows]
     summary_data = [
         ["Readings", "Avg", "Min", "Max"],
-        [str(len(temps)), f"{sum(temps)/len(temps):.1f}°C",
-         f"{min(temps):.1f}°C", f"{max(temps):.1f}°C"],
+        [str(len(values)), f"{sum(values)/len(values):.1f}{tag_unit}",
+         f"{min(values):.1f}{tag_unit}", f"{max(values):.1f}{tag_unit}"],
     ]
     summary_table = Table(summary_data, colWidths=[1.4*inch]*4)
     summary_table.setStyle(TableStyle([
@@ -617,20 +611,21 @@ def get_temperature_log_pdf(
 
     # Main log table — two columns side by side to fit more rows per page
     # (5-min intervals over 24h = up to 288 rows; single column would be very long)
-    table_data = [["Time", "Avg °C", "", "Time", "Avg °C"]]
+    value_header = f"Avg {tag_unit}"
+    table_data = [["Time", value_header, "", "Time", value_header]]
     half = (len(rows) + 1) // 2
     left_rows = rows[:half]
     right_rows = rows[half:]
 
     for i in range(half):
-        left_time = (left_rows[i]["bucket"] + _IST_OFFSET).strftime("%I:%M %p")
-        left_temp = f"{float(left_rows[i]['avg_temp']):.1f}"
+        left_time = (left_rows[i]["bucket"] + _IST_OFFSET).strftime("%H:%M")
+        left_val  = f"{float(left_rows[i]['avg_value']):.1f}"
         if i < len(right_rows):
-            right_time = (right_rows[i]["bucket"] + _IST_OFFSET).strftime("%I:%M %p")
-            right_temp = f"{float(right_rows[i]['avg_temp']):.1f}"
+            right_time = (right_rows[i]["bucket"] + _IST_OFFSET).strftime("%H:%M")
+            right_val  = f"{float(right_rows[i]['avg_value']):.1f}"
         else:
-            right_time, right_temp = "", ""
-        table_data.append([left_time, left_temp, "", right_time, right_temp])
+            right_time, right_val = "", ""
+        table_data.append([left_time, left_val, "", right_time, right_val])
 
     log_table = Table(table_data, colWidths=[1.1*inch, 0.8*inch, 0.3*inch, 1.1*inch, 0.8*inch])
     log_table.setStyle(TableStyle([
@@ -651,7 +646,8 @@ def get_temperature_log_pdf(
     doc.build(story)
     buffer.seek(0)
 
-    filename = f"mevion-jet27-temperature-{date}.pdf"
+    machine_slug = machine_name.lower().replace(" ", "-")
+    filename = f"mevion-{machine_slug}-{tag}-{date}.pdf"
     return StreamingResponse(
         buffer,
         media_type="application/pdf",
