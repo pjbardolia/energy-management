@@ -15,6 +15,11 @@ hardware specs belong in code, deployment config belongs in config.json):
   - YASKAWA_F7     : same spec as A1000
   - DELTA_CP2000   : 5 registers at 0x2200 (current/freq/dc_voltage/output_voltage)
   - ELECTROSIL_FX438 : 1 register at 0x0000 (process temperature)
+  - EUREKA_EU1000  : magnetic flowmeter — 2 registers at 2001 (instantaneous
+                     flow, float32) + extra reads at 2007/2009 (totalizer,
+                     uint32 + float32, summed into one flow_totalizer value).
+                     Requires ASCII framing + 7 data bits — see bus-level
+                     "framer"/"bytesize" keys in config.json (Jet 11's bus).
 
 Bus configuration (port, baudrate, devices list) lives in config.json under the
 "buses" array — add, remove, or reconfigure any bus without touching this file.
@@ -36,6 +41,7 @@ import logging
 import logging.handlers
 import os
 import sqlite3
+import struct
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -43,6 +49,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 from pymodbus.client import ModbusSerialClient
 from pymodbus.exceptions import ModbusIOException
+from pymodbus.framer import FramerType
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +202,41 @@ _ELECTROSIL_FX438_SPEC = {
     ],
 }
 
+# Eureka EU1000 magnetic flowmeter (Jet 11 water meter — bus dedicated to this
+# device only, no other device shares the port).
+#
+# Serial settings (bus-level, see config.json): 9600 baud, Odd parity, 7 data
+# bits, 1 stop bit, ASCII framing. Slave address = 1 — confirmed 2026-08-06
+# by reading the meter's own front-panel menu directly (not inferred from any
+# bench script). ASCII framing is the setting that made the meter respond at
+# all; every pre-ASCII-framing test (RTU default, full baud/parity/bytesize
+# sweep) got total silence.
+#
+# Register map confirmed against the physical front-panel display:
+#   2001 (2 regs, float32) = instantaneous flow, m3/h
+#   2007 (2 regs, uint32)  = totalizer integer part, L
+#   2009 (2 regs, float32) = totalizer fraction part, L
+# total_liters = int_part + frac_part — confirmed against a live display
+# reading of "Σ +11834910.06 L" (11834910 int + 0.06 frac, exact match).
+#
+# Both totalizer parts are summed into a single "flow_totalizer" tag by
+# read_modbus() below (see the EU1000-specific post-processing step) — only
+# flow_instantaneous and flow_totalizer are ever written to the outbox, never
+# the intermediate int/frac parts.
+_EUREKA_EU1000_SPEC = {
+    "address": 2001,
+    "count":   2,
+    "registers": [
+        ("flow_instantaneous", 0, 1, "float32"),
+    ],
+    "extra_reads": [
+        {"address": 2007, "count": 2,
+         "registers": [("_flow_totalizer_int", 0, 1, "uint32")]},
+        {"address": 2009, "count": 2,
+         "registers": [("_flow_totalizer_frac", 0, 1, "float32")]},
+    ],
+}
+
 # Master lookup: vfd_model string (as used in config.json) → register spec.
 # YASKAWA_A1000 and YASKAWA_V1000 point to the same spec object — they are
 # kept as separate model names so the device list is self-documenting.
@@ -205,6 +247,7 @@ VFD_REGISTER_MAPS = {
     "YASKAWA_F7":       _YASKAWA_SPEC,
     "DELTA_CP2000":     _DELTA_CP2000_SPEC,
     "ELECTROSIL_FX438": _ELECTROSIL_FX438_SPEC,
+    "EUREKA_EU1000":    _EUREKA_EU1000_SPEC,
 }
 
 # Non-VFD device models handled by their own dedicated read function
@@ -865,6 +908,28 @@ def post_heartbeat(
 # COMPONENT 5a — Modbus reader (single device)
 # ---------------------------------------------------------------------------
 
+def _decode_register(registers: list[int], reg_index: int, divisor: float, decode: str) -> float:
+    """Decode one tag's value out of a register block.
+
+    decode:
+        "scaled_int" (default) — registers[reg_index] / divisor. Unchanged
+            behaviour for every VFD spec that predates this function.
+        "float32" — registers[reg_index:reg_index+2] as one big-endian
+            IEEE-754 float (word order confirmed against the Eureka EU1000's
+            bench-tested totalizer fraction decode: high register first).
+            divisor is ignored (must be 1 in the spec, kept for symmetry).
+        "uint32"  — (registers[reg_index] << 16) | registers[reg_index+1],
+            i.e. a 32-bit unsigned long split across two registers, high
+            word first. divisor is ignored (must be 1 in the spec).
+    """
+    if decode == "float32":
+        packed = struct.pack(">HH", registers[reg_index], registers[reg_index + 1])
+        return struct.unpack(">f", packed)[0]
+    if decode == "uint32":
+        return (registers[reg_index] << 16) | registers[reg_index + 1]
+    return registers[reg_index] / divisor
+
+
 def read_modbus(
     client: ModbusSerialClient,
     slave_id: int,
@@ -873,8 +938,10 @@ def read_modbus(
     """Read registers from one VFD and return decoded tag values.
 
     Looks up the register spec for vfd_model from VFD_REGISTER_MAPS, reads
-    the appropriate address and count, then applies each register's divisor
-    to produce engineering-unit values.
+    the appropriate address and count, then decodes each register per its
+    spec entry — either scaled-integer (default, unchanged since Phase 5a)
+    or float32/uint32 for multi-register values (added for the Eureka EU1000
+    flowmeter — see _decode_register()).
 
     Args:
         client:    Open ModbusSerialClient (one shared connection for all devices
@@ -918,11 +985,16 @@ def read_modbus(
     # Decode registers using this model's spec.
     # Skip entries where tag_name is None — those registers are read as part
     # of the block but carry no value we store in the database.
+    # Each entry is (tag_name, reg_index, divisor) or, for multi-register
+    # values, (tag_name, reg_index, divisor, decode) — decode defaults to
+    # "scaled_int" (today's behaviour) when the 4th element is absent.
     values = {}
-    for tag_name, reg_index, divisor in spec["registers"]:
+    for entry in spec["registers"]:
+        tag_name, reg_index, divisor, *rest = entry
         if tag_name is None:
             continue
-        values[tag_name] = rr.registers[reg_index] / divisor
+        decode = rest[0] if rest else "scaled_int"
+        values[tag_name] = _decode_register(rr.registers, reg_index, divisor, decode)
 
     log.debug(
         "Slave %d [%s]: OK — freq=%.2f Hz  current=%.3f A  "
@@ -953,10 +1025,26 @@ def read_modbus(
             log.warning("Slave %d [%s]: extra read at 0x%04X error: %s",
                         slave_id, vfd_model, extra["address"], er)
             continue
-        for tag_name, reg_index, divisor in extra["registers"]:
+        for entry in extra["registers"]:
+            tag_name, reg_index, divisor, *rest = entry
             if tag_name is None:
                 continue
-            values[tag_name] = er.registers[reg_index] / divisor
+            decode = rest[0] if rest else "scaled_int"
+            values[tag_name] = _decode_register(er.registers, reg_index, divisor, decode)
+
+    # Eureka EU1000: fold the two totalizer parts (read as separate extra_reads
+    # because registers 2007/2009 are non-contiguous) into one flow_totalizer
+    # value. Only flow_instantaneous and flow_totalizer are ever written to the
+    # outbox — the intermediate _flow_totalizer_int/_flow_totalizer_frac keys
+    # never leave this function. If either extra read failed this cycle, the
+    # intermediate key is simply absent (per the non-fatal handling above) and
+    # flow_totalizer is skipped for this cycle rather than computed from a
+    # partial pair — flow_instantaneous is still returned untouched.
+    if vfd_model == "EUREKA_EU1000":
+        int_part = values.pop("_flow_totalizer_int", None)
+        frac_part = values.pop("_flow_totalizer_frac", None)
+        if int_part is not None and frac_part is not None:
+            values["flow_totalizer"] = int_part + frac_part
 
     return values
 
@@ -1018,6 +1106,12 @@ def _poll_bus(
     baudrate = bus["baudrate"]
     parity   = bus.get("parity", "N")
     stopbits = bus.get("stopbits", 1)
+    # bytesize/framer default to today's only-ever-used values (8 data bits,
+    # RTU framing) so every existing bus config is unaffected. The Eureka
+    # EU1000 flowmeter bus is the first to override either — 7 data bits,
+    # ASCII framing (see config.json).
+    bytesize = bus.get("bytesize", 8)
+    framer   = FramerType.ASCII if bus.get("framer") == "ascii" else FramerType.RTU
     devices  = bus["devices"]
 
     machines_polled = len(devices)
@@ -1029,7 +1123,8 @@ def _poll_bus(
         baudrate=baudrate,
         parity=parity,
         stopbits=stopbits,
-        bytesize=8,
+        bytesize=bytesize,
+        framer=framer,
         timeout=1,
     )
 
