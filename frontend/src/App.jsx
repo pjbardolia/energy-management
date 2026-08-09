@@ -2108,11 +2108,31 @@ function fmtDuration(minutes) {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
+// Fixed per-jet color palette — refined, non-neon hues with enough hue
+// separation to stay distinguishable across 25+ rows.
+const GANTT_PALETTE = [
+  "#2563eb", "#db2777", "#059669", "#d97706", "#7c3aed",
+  "#0891b2", "#65a30d", "#c026d3", "#0d9488", "#ea580c",
+];
+
+// Deterministic hash of machine_id -> palette index, NOT array/render order —
+// a given jet keeps the same color across page loads and tabs even if the
+// machines array's order or membership shifts (e.g. a machine drops out of
+// the current range).
+function machineColor(machineId) {
+  const idx = Math.abs((machineId * 2654435761) % GANTT_PALETTE.length);
+  return GANTT_PALETTE[idx];
+}
+
 // ── Gantt sub-view ─────────────────────────────────────────────────────
 function GanttView({ token, onLogout }) {
   const [rangeHours, setRangeHours] = useState(24);
   const [timeline, setTimeline] = useState(null);
   const [loading, setLoading] = useState(true);
+  // Tooltip state, driven by mousemove on segments/gaps — {x, y, machineName,
+  // state, color, startMs, endMs} or null. Position tracks the cursor
+  // directly (fixed positioning) rather than being pinned to the segment.
+  const [hover, setHover] = useState(null);
 
   useEffect(() => {
     if (!token) return;
@@ -2138,6 +2158,15 @@ function GanttView({ token, onLogout }) {
 
   return (
     <div>
+      {/* Hover-grow effect for running segments — !important needed to win
+          over the inline base height, same pattern as .so:hover elsewhere
+          in this file. Gaps stay visually static (they're invisible; the
+          tooltip itself is the hover confirmation there). */}
+      <style>{`
+        .gantt-seg { transition: height 0.1s, box-shadow 0.1s; }
+        .gantt-seg:hover { height: 12px !important; box-shadow: 0 0 0 3px rgba(0,0,0,0.06); }
+      `}</style>
+
       <div style={{ display: 'flex', gap: 4, marginBottom: 16 }}>
         {GANTT_RANGES.map(r => (
           <button key={r.label} onClick={() => setRangeHours(r.hours)} style={{
@@ -2160,7 +2189,7 @@ function GanttView({ token, onLogout }) {
         ) : (
           <>
             {/* Time axis */}
-            <div style={{ display: 'flex', marginLeft: 110, position: 'relative', height: 20, marginBottom: 4 }}>
+            <div style={{ display: 'flex', marginLeft: 84, position: 'relative', height: 20, marginBottom: 4 }}>
               {[0, 0.2, 0.4, 0.6, 0.8, 1].map(frac => (
                 <span key={frac} style={{
                   position: 'absolute', left: `${frac * 100}%`,
@@ -2172,46 +2201,98 @@ function GanttView({ token, onLogout }) {
               ))}
             </div>
 
-            {/* Rows — compact height so all machines fit without excessive scrolling */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-              {machines.map(m => (
-                <div key={m.machine_id} style={{ display: 'flex', alignItems: 'center', height: 22 }}>
-                  <div style={{
-                    width: 110, flexShrink: 0, fontSize: 11, color: '#374151',
-                    fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                  }}>{m.machine_name}</div>
-                  <div style={{ position: 'relative', flex: 1, height: 16, background: '#f3f4f6', borderRadius: 3 }}>
-                    {m.intervals.map((iv, i) => {
-                      const start = new Date(iv.started_at).getTime();
-                      const end   = new Date(iv.ended_at).getTime();
-                      const left  = Math.max(0, ((start - fromMs) / totalMs) * 100);
-                      const width = Math.max(0.3, ((end - start) / totalMs) * 100);
-                      const durationMin = (end - start) / 60000;
-                      return (
-                        <div key={i}
-                          title={`${iv.state === 'running' ? 'Running' : 'Stopped'}: ${new Date(start).toLocaleString('en-GB', { timeZone: 'Asia/Kolkata' })} → ${new Date(end).toLocaleString('en-GB', { timeZone: 'Asia/Kolkata' })} (${fmtDuration(durationMin)})`}
-                          style={{
+            {/* Rows — hairline track, compact height so all machines fit
+                without excessive scrolling */}
+            <div>
+              {machines.map(m => {
+                const color = machineColor(m.machine_id);
+                return (
+                  <div key={m.machine_id} style={{ display: 'flex', alignItems: 'center', height: 32 }}>
+                    <div style={{
+                      width: 76, flexShrink: 0, fontSize: 12, color: '#334155',
+                      fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}>{m.machine_name}</div>
+                    <div style={{ position: 'relative', flex: 1, height: 32 }}>
+                      {/* Hairline track */}
+                      <div style={{
+                        position: 'absolute', top: '50%', left: 0, right: 0,
+                        height: 2, background: '#eef1f4', borderRadius: 2,
+                        transform: 'translateY(-50%)',
+                      }} />
+                      {m.intervals.map((iv, i) => {
+                        const start = new Date(iv.started_at).getTime();
+                        const end   = new Date(iv.ended_at).getTime();
+                        const left  = Math.max(0, ((start - fromMs) / totalMs) * 100);
+                        const width = Math.max(0.3, ((end - start) / totalMs) * 100);
+                        const isRunning = iv.state === 'running';
+                        const commonHandlers = {
+                          onMouseMove: (e) => setHover({
+                            x: e.clientX, y: e.clientY,
+                            machineName: m.machine_name, state: iv.state, color,
+                            startMs: start, endMs: end,
+                          }),
+                          onMouseLeave: () => setHover(null),
+                        };
+                        return isRunning ? (
+                          <div key={i} className="gantt-seg" {...commonHandlers} style={{
                             position: 'absolute', left: `${left}%`, width: `${width}%`,
-                            top: 0, bottom: 0,
-                            background: iv.state === 'running' ? C.running : C.stopped,
-                            borderRadius: 2,
-                          }}
-                        />
-                      );
-                    })}
+                            top: '50%', height: 8, borderRadius: 4,
+                            transform: 'translateY(-50%)', cursor: 'pointer',
+                            background: color,
+                          }} />
+                        ) : (
+                          // Stopped interval — invisible, but the same
+                          // clickable/hoverable height as a segment so the
+                          // gap is just as easy to target.
+                          <div key={i} className="gantt-gap" {...commonHandlers} style={{
+                            position: 'absolute', left: `${left}%`, width: `${width}%`,
+                            top: '50%', height: 14, transform: 'translateY(-50%)',
+                            cursor: 'pointer', background: 'transparent',
+                          }} />
+                        );
+                      })}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
 
-            {/* Legend */}
-            <div style={{ display: 'flex', gap: 16, marginTop: 16, fontSize: 11, color: '#6b7280' }}>
-              <span><span style={{ display: 'inline-block', width: 10, height: 10, background: C.running, borderRadius: 2, marginRight: 5 }} />Running</span>
-              <span><span style={{ display: 'inline-block', width: 10, height: 10, background: C.stopped, borderRadius: 2, marginRight: 5 }} />Stopped</span>
+            {/* Legend — one swatch per visible machine, same color mapping as the rows */}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px 18px', marginTop: 20, paddingLeft: 84 }}>
+              {machines.map(m => (
+                <span key={m.machine_id} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11.5, color: '#64748b' }}>
+                  <span style={{ width: 14, height: 5, borderRadius: 3, background: machineColor(m.machine_id) }} />
+                  {m.machine_name}
+                </span>
+              ))}
             </div>
           </>
         )}
       </div>
+
+      {/* Tooltip — follows the cursor, shows exact real timestamps (not
+          interpolated from percentages) and duration. */}
+      {hover && (
+        <div style={{
+          position: 'fixed', left: hover.x, top: hover.y,
+          transform: 'translate(-50%, -110%)',
+          background: '#0f172a', color: '#fff', fontSize: 12,
+          padding: '8px 11px', borderRadius: 8, pointerEvents: 'none',
+          whiteSpace: 'nowrap', zIndex: 100, boxShadow: '0 4px 16px rgba(0,0,0,0.18)',
+        }}>
+          <div style={{ fontWeight: 600, marginBottom: 2 }}>{hover.machineName}</div>
+          <div>
+            <span style={{
+              display: 'inline-block', width: 6, height: 6, borderRadius: '50%', marginRight: 5,
+              background: hover.state === 'running' ? hover.color : '#64748b',
+            }} />
+            {hover.state === 'running' ? 'Running' : 'Stopped'}: {fmtDayTime24(new Date(hover.startMs))} – {fmtDayTime24(new Date(hover.endMs))}
+          </div>
+          <div style={{ color: '#94a3b8', marginTop: 2 }}>
+            {fmtDuration((hover.endMs - hover.startMs) / 60000)}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

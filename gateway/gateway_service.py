@@ -219,6 +219,20 @@ _ELECTROSIL_FX438_SPEC = {
 # total_liters = int_part + frac_part — confirmed against a live display
 # reading of "Σ +11834910.06 L" (11834910 int + 0.06 frac, exact match).
 #
+# TORN-READ FIX (2026-08-06): 2007-2010 is one contiguous 4-register span, so
+# the integer and fraction parts are now read as a SINGLE Modbus transaction
+# instead of two separate ones. This closes the cross-transaction skew window
+# entirely, but does NOT by itself rule out the meter's own firmware tearing
+# a multi-register response internally (no EU1000 documentation confirming
+# register-level snapshot/latch behavior exists in this repo) — see the
+# plausibility bounds-check in read_modbus()'s EU1000 post-processing step,
+# which is the actual defense against a torn read regardless of where it
+# originates. Root-cause diagnosis: production totalizer values were swinging
+# by 5,000-44,000 L between ~30s polls while real flow (~3 m3/h) could only
+# account for ~25-27 L — the magnitude (all under 65536 = 2^16) matches a
+# 16-bit high/low word tear, not the ~1 L error a pure int/frac skew would
+# produce, which is why the bounds-check exists in addition to this combine.
+#
 # Both totalizer parts are summed into a single "flow_totalizer" tag by
 # read_modbus() below (see the EU1000-specific post-processing step) — only
 # flow_instantaneous and flow_totalizer are ever written to the outbox, never
@@ -230,10 +244,11 @@ _EUREKA_EU1000_SPEC = {
         ("flow_instantaneous", 0, 1, "float32"),
     ],
     "extra_reads": [
-        {"address": 2007, "count": 2,
-         "registers": [("_flow_totalizer_int", 0, 1, "uint32")]},
-        {"address": 2009, "count": 2,
-         "registers": [("_flow_totalizer_frac", 0, 1, "float32")]},
+        {"address": 2007, "count": 4,   # 2007-2010: int part (2007-2008) + frac part (2009-2010), one read
+         "registers": [
+             ("_flow_totalizer_int",  0, 1, "uint32"),
+             ("_flow_totalizer_frac", 2, 1, "float32"),
+         ]},
     ],
 }
 
@@ -930,10 +945,44 @@ def _decode_register(registers: list[int], reg_index: int, divisor: float, decod
     return registers[reg_index] / divisor
 
 
+# EU1000 totalizer plausibility check — defends against a torn multi-register
+# read regardless of whether the tear happens in our own two-transaction gap
+# (now closed, see _EUREKA_EU1000_SPEC) or inside the meter's own firmware
+# response-building (which we cannot verify or rule out — no EU1000 register-
+# atomicity documentation exists in this repo). Keyed by component_instance_id
+# (not slave_id) so it stays correct once Jet 12 exists on a different bus and
+# happens to reuse slave_id=1 — a plain slave_id key would silently conflate
+# the two devices' totalizer histories.
+#
+# Threshold derivation (2026-08-06, confirmed running flow ~3 m3/h):
+#   generous realistic max flow ceiling = 4x observed = 12 m3/h (an assumption,
+#   not a manufacturer spec — no rated max flow for this install is documented
+#   anywhere in this repo; adjust if a real rating becomes available)
+#   x10 safety margin (requested explicitly) = 120 m3/h = 33.33 L/s
+# At the ~30s poll spacing seen in production this is a ~1000 L window: ~40x
+# headroom above any physically real delta (~25 L @ 3 m3/h over 30s), and
+# comfortably below every torn reading observed (smallest was 5,875 L).
+#
+# This rate check is paired with an unconditional monotonic-decrease check
+# (any delta < 0 is rejected outright) — added after confirming against the
+# actual 2026-08-06 incident sequence that the rate check alone accepts a
+# torn reading once enough prior rejections have widened the window. See the
+# monotonic-decrease branch below for the reset-vs-torn-read tradeoff this
+# implies.
+_EU1000_MAX_PLAUSIBLE_RATE_L_PER_SEC = 33.33
+
+# component_instance_id -> (last_accepted_total_liters, wall_clock_time)
+# Only updated on ACCEPTED readings — a rejected reading does not move the
+# baseline, so the next reading is compared against the same last-known-good
+# value with a correspondingly wider (correctly so) plausible window.
+_last_totalizer_reading: dict[int, tuple[float, float]] = {}
+
+
 def read_modbus(
     client: ModbusSerialClient,
     slave_id: int,
     vfd_model: str,
+    component_instance_id: int | None = None,
 ) -> dict | None:
     """Read registers from one VFD and return decoded tag values.
 
@@ -948,6 +997,10 @@ def read_modbus(
                    on the same RS485 bus).
         slave_id:  Modbus slave address of this specific device.
         vfd_model: Key into VFD_REGISTER_MAPS (e.g. "INVT_CHF100A").
+        component_instance_id: Only used by the EUREKA_EU1000 plausibility
+                   check below, to key the last-accepted-totalizer cache per
+                   physical device. Unused (and harmless to omit) for every
+                   other vfd_model.
 
     Returns:
         dict mapping tag_name → float value for all non-None named registers.
@@ -1032,19 +1085,84 @@ def read_modbus(
             decode = rest[0] if rest else "scaled_int"
             values[tag_name] = _decode_register(er.registers, reg_index, divisor, decode)
 
-    # Eureka EU1000: fold the two totalizer parts (read as separate extra_reads
-    # because registers 2007/2009 are non-contiguous) into one flow_totalizer
-    # value. Only flow_instantaneous and flow_totalizer are ever written to the
-    # outbox — the intermediate _flow_totalizer_int/_flow_totalizer_frac keys
-    # never leave this function. If either extra read failed this cycle, the
-    # intermediate key is simply absent (per the non-fatal handling above) and
-    # flow_totalizer is skipped for this cycle rather than computed from a
-    # partial pair — flow_instantaneous is still returned untouched.
+    # Eureka EU1000: fold the two totalizer parts (now read together in one
+    # 4-register transaction — see _EUREKA_EU1000_SPEC) into one flow_totalizer
+    # value, then run it past a plausibility check before accepting it. Only
+    # flow_instantaneous and flow_totalizer are ever written to the outbox —
+    # the intermediate _flow_totalizer_int/_flow_totalizer_frac keys never
+    # leave this function. If the read failed this cycle, the intermediate
+    # keys are simply absent (per the non-fatal handling above) and
+    # flow_totalizer is skipped — flow_instantaneous is still returned untouched.
     if vfd_model == "EUREKA_EU1000":
         int_part = values.pop("_flow_totalizer_int", None)
         frac_part = values.pop("_flow_totalizer_frac", None)
         if int_part is not None and frac_part is not None:
-            values["flow_totalizer"] = int_part + frac_part
+            candidate_total = int_part + frac_part
+            now = time.time()
+            last = _last_totalizer_reading.get(component_instance_id)
+
+            if last is None:
+                # First reading ever for this device (process just started, or
+                # this is the very first poll since deploy) — there is nothing
+                # to compare against. Accept unconditionally: rejecting here
+                # would mean a service restart silently withholds
+                # flow_totalizer forever, since the cache is always empty
+                # immediately after a restart and no later reading would ever
+                # have anything "known-good" to compare against either.
+                values["flow_totalizer"] = candidate_total
+                _last_totalizer_reading[component_instance_id] = (candidate_total, now)
+            else:
+                last_total, last_time = last
+                elapsed = max(now - last_time, 0.01)  # guard only against div-by-zero
+                delta = candidate_total - last_total
+                max_plausible = _EU1000_MAX_PLAUSIBLE_RATE_L_PER_SEC * elapsed
+
+                # Monotonic-decrease check FIRST, independent of elapsed time —
+                # a real totalizer never decreases, so this catches torn reads
+                # the rate check alone would miss once enough consecutive
+                # rejections have widened the plausible window (confirmed
+                # against production incident data: reading #4 in the 2026-08-06
+                # sequence was a decrease that the rate check alone accepted
+                # after 3 prior rejections widened the window to ±4233 L).
+                #
+                # KNOWN LIMITATION: a genuine meter reset (totalizer physically
+                # zeroed) is also a decrease and will be rejected by this check
+                # forever — the cache never updates on rejection, so every
+                # subsequent post-reset reading looks like "a decrease from the
+                # old high baseline" too, permanently withholding
+                # flow_totalizer until the gateway service restarts (which
+                # clears the in-memory cache). This is a deliberate tradeoff,
+                # not an oversight: distinguishing "torn read" from "genuine
+                # reset" here would need a near-zero-value carve-out that adds
+                # real complexity, and reset handling is already planned at
+                # the backend/consumption-calculation layer (see Part B spec)
+                # where the full reading history is visible, not just the
+                # last one. A real meter reset is a rare, known event — restart
+                # the gateway service after one.
+                if delta < 0:
+                    log.warning(
+                        "Slave %d [EUREKA_EU1000]: totalizer decreased by %.2f L "
+                        "(torn read, or a genuine meter reset — see code comment) "
+                        "— skipping flow_totalizer this cycle (last good: %.2f L)",
+                        slave_id, -delta, last_total,
+                    )
+                elif delta > max_plausible:
+                    # Implausible jump — almost certainly a torn read (see
+                    # _EUREKA_EU1000_SPEC comment). Skip flow_totalizer this
+                    # cycle rather than write garbage; deliberately do NOT
+                    # update the cache, so the next reading is compared
+                    # against the same last-known-good value with a
+                    # correspondingly wider (still correct) plausible window.
+                    log.warning(
+                        "Slave %d [EUREKA_EU1000]: implausible totalizer jump "
+                        "%.2f L in %.1fs (max plausible %.2f L) — likely a "
+                        "torn read, skipping flow_totalizer this cycle "
+                        "(last good: %.2f L)",
+                        slave_id, delta, elapsed, max_plausible, last_total,
+                    )
+                else:
+                    values["flow_totalizer"] = candidate_total
+                    _last_totalizer_reading[component_instance_id] = (candidate_total, now)
 
     return values
 
@@ -1150,10 +1268,13 @@ def _poll_bus(
             dev_label    = "{} / slave={}".format(dev_name, slave_id)
 
             # read_modbus() catches Modbus-layer errors and returns None.
+            # component_instance_id is only used by the EU1000 plausibility
+            # check (see read_modbus()'s docstring) — harmless for every
+            # other vfd_model.
             if vfd_model == "WAVESHARE_AI8CH":
                 values = read_ai8ch_pressure(client, slave_id)
             else:
-                values = read_modbus(client, slave_id, vfd_model)
+                values = read_modbus(client, slave_id, vfd_model, component_instance_id=component_id)
 
             if values is None:
                 machines_failed += 1
