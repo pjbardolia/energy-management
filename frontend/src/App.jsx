@@ -2480,8 +2480,182 @@ function OEECardsView({ token, onLogout }) {
   );
 }
 
+// ── Machine Log sub-view ───────────────────────────────────────────────
+// Operator-accountability view: one machine, one operational day, full
+// running/stopped history. Reuses the same /machines/{id}/state-timeline
+// endpoint GanttView uses — no new JSON endpoint — just computes from/to as
+// the selected date's 09:00-IST-to-09:00-IST bounds instead of GanttView's
+// "now minus N hours" math.
+function MachineLogView({ token, onLogout }) {
+  const [selectedMachineId, setSelectedMachineId] = useState(MACHINES[0].id);
+  const [logDate, setLogDate] = useState(() => {
+    // Default to current operational day: if before 9am IST, use yesterday
+    // — identical snippet to TemperatureAndPressurePage's logDate default.
+    const now = new Date();
+    const istHour = (now.getUTCHours() + 5) % 24 + (now.getUTCMinutes() >= 30 ? 0.5 : 0);
+    const d = new Date(now);
+    if (istHour < 9) d.setDate(d.getDate() - 1);
+    return d.toISOString().slice(0, 10);
+  });
+  const [timeline, setTimeline] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setLoading(true);
+
+    // Selected date's operational day: 09:00 IST -> 09:00 IST next day,
+    // expressed as UTC ISO instants for the existing state-timeline endpoint.
+    const [y, mo, da] = logDate.split('-').map(Number);
+    const fromUtc = new Date(Date.UTC(y, mo - 1, da, 3, 30, 0)); // 09:00 IST = 03:30 UTC
+    const toUtc = new Date(fromUtc.getTime() + 24 * 3600_000);
+
+    apiFetch(`/machines/${selectedMachineId}/state-timeline?from=${fromUtc.toISOString()}&to=${toUtc.toISOString()}`, token)
+      .then(data => { if (!cancelled) { setTimeline(data); setLoading(false); } })
+      .catch(e => { if (!cancelled) { setLoading(false); if (e.status === 401) onLogout(); } });
+
+    return () => { cancelled = true; };
+  }, [token, selectedMachineId, logDate, onLogout]);
+
+  const intervals = timeline?.intervals || [];
+
+  // Summary stats — computed client-side from the same intervals the table renders.
+  let runningMin = 0, stoppedMin = 0, stoppageCount = 0, longestStopMin = 0;
+  intervals.forEach(iv => {
+    const minutes = (new Date(iv.ended_at) - new Date(iv.started_at)) / 60000;
+    if (iv.state === 'running') {
+      runningMin += minutes;
+    } else {
+      stoppedMin += minutes;
+      stoppageCount += 1;
+      longestStopMin = Math.max(longestStopMin, minutes);
+    }
+  });
+
+  function downloadStateLogPdf() {
+    const url = `/api/machines/${selectedMachineId}/state-log/pdf?date=${logDate}`;
+    fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+      .then(res => res.blob())
+      .then(blob => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        const machineName = MACHINES.find(m => m.id === selectedMachineId)?.name || 'machine';
+        const slug = machineName.toLowerCase().replace(/\s+/g, '-');
+        a.download = `mevion-${slug}-machine-log-${logDate}.pdf`;
+        a.click();
+      });
+  }
+
+  return (
+    <div>
+      <div style={{
+        display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center',
+        justifyContent: 'space-between', marginBottom: 16,
+      }}>
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span style={{ fontSize: 13, color: '#6b7280' }}>Machine:</span>
+            <select
+              value={selectedMachineId}
+              onChange={e => setSelectedMachineId(parseInt(e.target.value))}
+              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #e5e7eb',
+                fontSize: 13, color: '#1f2937', fontWeight: 600 }}
+            >
+              {/* Full MACHINES list, unfiltered — every monitored machine shows
+                  here regardless of whether it has state data for this date,
+                  deliberately different from GanttView's/TemperatureAndPressurePage's
+                  "only machines with data" selectors. */}
+              {MACHINES.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span style={{ fontSize: 13, color: '#6b7280' }}>Date:</span>
+            <input type="date" value={logDate} onChange={e => setLogDate(e.target.value)}
+              style={{ padding: '5px 10px', borderRadius: 6, border: '1px solid #e5e7eb',
+                fontSize: 13, color: '#1f2937' }} />
+          </div>
+        </div>
+        <button onClick={downloadStateLogPdf} style={{
+          padding: '6px 16px', borderRadius: 6, fontSize: 13, fontWeight: 600,
+          background: C.red, color: '#fff', border: 'none', cursor: 'pointer',
+        }}>Download PDF</button>
+      </div>
+
+      {loading ? (
+        <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>Loading...</div>
+      ) : intervals.length === 0 ? (
+        <div style={{ color: '#9ca3af', padding: 40, textAlign: 'center' }}>
+          No state data for this machine on this date.
+        </div>
+      ) : (
+        <>
+          {/* Summary row */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 14, marginBottom: 20 }}>
+            {[
+              { label: 'Total Running', value: fmtDuration(runningMin), color: '#16a34a' },
+              { label: 'Total Stopped', value: fmtDuration(stoppedMin), color: '#dc2626' },
+              { label: 'Stoppage Events', value: String(stoppageCount), color: '#1f2937' },
+              { label: 'Longest Stop', value: fmtDuration(longestStopMin), color: '#d97706' },
+            ].map(stat => (
+              <div key={stat.label} style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: '16px 18px' }}>
+                <div style={{ fontSize: 11, color: '#9ca3af', marginBottom: 6, fontWeight: 500, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  {stat.label}
+                </div>
+                <div style={{ fontSize: 22, fontWeight: 800, color: stat.color, fontVariantNumeric: 'tabular-nums' }}>
+                  {stat.value}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Interval table */}
+          <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16, padding: 24 }}>
+            <div style={{ overflowX: 'auto', maxHeight: 500, overflowY: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ position: 'sticky', top: 0, background: '#fff' }}>
+                    <th style={{ padding: '8px 12px', textAlign: 'left', color: '#6b7280', borderBottom: '1px solid #e5e7eb' }}>Status</th>
+                    <th style={{ padding: '8px 12px', textAlign: 'left', color: '#6b7280', borderBottom: '1px solid #e5e7eb' }}>Start</th>
+                    <th style={{ padding: '8px 12px', textAlign: 'left', color: '#6b7280', borderBottom: '1px solid #e5e7eb' }}>End</th>
+                    <th style={{ padding: '8px 12px', textAlign: 'right', color: '#6b7280', borderBottom: '1px solid #e5e7eb' }}>Duration</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {intervals.map((iv, i) => {
+                    const start = new Date(iv.started_at);
+                    const end = new Date(iv.ended_at);
+                    const minutes = (end - start) / 60000;
+                    const isRunning = iv.state === 'running';
+                    return (
+                      <tr key={i} style={{ background: i % 2 === 0 ? 'transparent' : '#f9fafb' }}>
+                        <td style={{ padding: '8px 12px' }}>
+                          <span style={{
+                            fontSize: 10, fontWeight: 700, letterSpacing: 0.5,
+                            background: isRunning ? '#22c55e' : '#dc2626', color: '#fff',
+                            padding: '2px 8px', borderRadius: 4,
+                          }}>{isRunning ? 'RUNNING' : 'STOPPED'}</span>
+                        </td>
+                        <td style={{ padding: '8px 12px', color: '#1f2937' }}>{fmtDayTime24(start)}</td>
+                        <td style={{ padding: '8px 12px', color: '#1f2937' }}>{fmtDayTime24(end)}</td>
+                        <td style={{ padding: '8px 12px', textAlign: 'right', color: '#374151', fontWeight: 600 }}>
+                          {fmtDuration(minutes)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function UptimePage({ token, onLogout }) {
-  const [view, setView] = useState('gantt'); // 'gantt' | 'heatmap' | 'oee'
+  const [view, setView] = useState('gantt'); // 'gantt' | 'heatmap' | 'oee' | 'log'
 
   return (
     <div style={{ padding: '24px 32px', maxWidth: 1200, margin: '0 auto' }}>
@@ -2490,7 +2664,7 @@ function UptimePage({ token, onLogout }) {
       </h2>
 
       <div style={{ display: 'flex', gap: 4, marginBottom: 20 }}>
-        {[['gantt', 'Gantt Timeline'], ['heatmap', 'Heatmap Calendar'], ['oee', 'OEE Cards']].map(([val, label]) => (
+        {[['gantt', 'Gantt Timeline'], ['heatmap', 'Heatmap Calendar'], ['oee', 'OEE Cards'], ['log', 'Machine Log']].map(([val, label]) => (
           <button key={val} onClick={() => setView(val)} style={{
             padding: '6px 16px', borderRadius: 6, fontSize: 13,
             background: view === val ? C.red : 'transparent',
@@ -2504,6 +2678,7 @@ function UptimePage({ token, onLogout }) {
       {view === 'gantt'   && <GanttView token={token} onLogout={onLogout} />}
       {view === 'heatmap' && <HeatmapView token={token} onLogout={onLogout} />}
       {view === 'oee'     && <OEECardsView token={token} onLogout={onLogout} />}
+      {view === 'log'     && <MachineLogView token={token} onLogout={onLogout} />}
     </div>
   );
 }
