@@ -16,20 +16,28 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API_URL   = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 
-def send_alert(message: str) -> None:
+def send_alert(message: str, chat_id: str | None = None) -> None:
     """
-    Send a Telegram message to the configured chat.
+    Send a Telegram message to a chat.
+
+    chat_id: optional override — defaults to TELEGRAM_CHAT_ID when omitted,
+    so every pre-existing caller (gateway offline, overcurrent) is unaffected.
+    Pass an explicit chat_id to send to a different destination with the
+    same bot token (e.g. machine stop/start alerts going to their own chat).
+
     Never raises — logs warning on failure.
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured — TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing")
+    target_chat_id = chat_id or TELEGRAM_CHAT_ID
+
+    if not TELEGRAM_BOT_TOKEN or not target_chat_id:
+        log.warning("Telegram not configured — TELEGRAM_BOT_TOKEN or chat_id missing")
         return
 
     try:
         resp = requests.post(
             TELEGRAM_API_URL,
             json={
-                "chat_id":    TELEGRAM_CHAT_ID,
+                "chat_id":    target_chat_id,
                 "text":       message,
                 "parse_mode": "HTML",
             },

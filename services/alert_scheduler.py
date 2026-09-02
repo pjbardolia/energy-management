@@ -5,12 +5,22 @@ Runs a background APScheduler job every 60 seconds checking:
 1. Gateway offline (>20 minutes without heartbeat) — alert once, recover once
 2. Motor overcurrent (current > OVERCURRENT_THRESHOLD_A) — alert once per
    machine, recover once per machine when current drops back below threshold
+3. Machine stop/start — alert once per machine when it stops, recover once
+   when it starts running again, with the stopped duration
 
 Alert state is kept in memory — resets on server restart, which is acceptable
 since the scheduler will re-detect any active conditions within 60 seconds.
+
+Machine stop/start alerts do NOT recompute running/stopped from raw telemetry
+— they read the same machine_state_event table that already powers the
+Uptime tab's Gantt Timeline, Heatmap Calendar, and Machine Log (written by
+services/state_tracker.py's frequency>0 threshold check, its own separate
+60s job). Reading the same stored fact the dashboard reads guarantees this
+alert can never disagree with what the dashboard shows for the same moment.
 """
 
 import logging
+import os
 from datetime import datetime, timezone, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -27,11 +37,26 @@ GATEWAY_OFFLINE_THRESHOLD_MINUTES = 20
 OVERCURRENT_THRESHOLD_A           = 13.0  # Amperes — alert when any machine exceeds this
 COMPANY_ID                        = 1     # SSPPL — extend to multi-tenant later
 
+# Separate Telegram destination for machine stop/start alerts ("Machine
+# ON/OFF" group) — same bot token as everything else (services/telegram.py),
+# just a different chat_id. Deliberately does NOT fall back to the default
+# TELEGRAM_CHAT_ID if unset — see check_machine_state_alerts(), which checks
+# this is truthy before calling send_alert at all, so a misconfiguration
+# shows up as a clear skipped-send warning rather than silently mixing
+# machine state alerts into the overcurrent chat.
+MACHINE_STATE_CHAT_ID = os.environ.get("TELEGRAM_MACHINE_STATE_CHAT_ID", "")
+
 # --- In-memory alert state ---
 # Prevents sending duplicate alerts every 60 seconds.
 # Resets on server restart; scheduler re-detects within one cycle.
 _gateway_alert_sent    = False
 _overcurrent_machines: dict[str, bool] = {}  # machine_name -> True if alert active
+
+# machine_id -> (last_known_state, started_at of that state's interval).
+# Tuple (not a plain bool like _overcurrent_machines) because the recovery
+# message needs to know when the stopped interval began, to report how long
+# the machine was down.
+_machine_run_state: dict[int, tuple[str, datetime]] = {}
 
 
 def check_gateway_offline() -> None:
@@ -169,6 +194,113 @@ def check_overcurrent() -> None:
         db.close()
 
 
+def check_machine_state_alerts() -> None:
+    """
+    Alert on machine stop/start transitions.
+
+    Reads ONLY the currently-open interval per machine from
+    machine_state_event (WHERE ended_at IS NULL) — the exact same stored
+    fact the Uptime tab's Gantt Timeline, Heatmap Calendar, and Machine Log
+    already display. Does not recompute running/stopped from telemetry;
+    that determination happens once, in services/state_tracker.py's own
+    60s job, and is never duplicated here.
+
+    First observation of a machine (cache empty — e.g. right after a service
+    restart) seeds the cache silently, without alerting. Without this, every
+    restart would fire a stop-alert for every machine that happened to
+    already be stopped at that moment.
+    """
+    global _machine_run_state
+
+    db = SessionLocal()
+    try:
+        sql = text("""
+            SELECT
+                m.id         AS machine_id,
+                m.name       AS machine_name,
+                e.state,
+                e.started_at
+            FROM machine_state_event e
+            JOIN machine m ON m.id = e.machine_id
+            WHERE e.company_id = :company_id
+              AND e.ended_at IS NULL
+        """)
+
+        rows = db.execute(sql, {"company_id": COMPANY_ID}).mappings().fetchall()
+
+        for row in rows:
+            machine_id   = row["machine_id"]
+            machine_name = row["machine_name"]
+            state        = row["state"]
+            started_at   = row["started_at"]
+            # Normalise to UTC in case the driver returns a naive datetime
+            # (same guard already used in check_gateway_offline).
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+
+            last = _machine_run_state.get(machine_id)
+
+            if last is None:
+                # First observation for this machine — nothing to compare
+                # against. Seed the cache, do not alert.
+                _machine_run_state[machine_id] = (state, started_at)
+                continue
+
+            last_state, last_started_at = last
+
+            if state == last_state:
+                # No change — this is the anti-spam guarantee: one alert per
+                # transition, silence while the state persists.
+                continue
+
+            now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+            started_at_ist = started_at + timedelta(hours=5, minutes=30)
+
+            if state == "stopped":
+                msg = (
+                    f"🔴 <b>{machine_name} STOPPED</b> — SSPPL\n\n"
+                    f"Stopped at {started_at_ist.strftime('%d %b, %I:%M %p')} IST"
+                )
+                if MACHINE_STATE_CHAT_ID:
+                    send_alert(msg, chat_id=MACHINE_STATE_CHAT_ID)
+                    log.warning("Machine stop alert: %s at %s", machine_name, started_at_ist)
+                else:
+                    log.warning(
+                        "Machine state alert chat not configured "
+                        "(TELEGRAM_MACHINE_STATE_CHAT_ID unset) — skipping send: %s", msg,
+                    )
+
+            elif state == "running" and last_state == "stopped":
+                # last_started_at is when the STOPPED interval began (the
+                # value cached the last time we saw this machine as stopped),
+                # so duration = now - that instant.
+                stopped_duration = datetime.now(timezone.utc) - last_started_at
+                hours   = int(stopped_duration.total_seconds() // 3600)
+                minutes = int((stopped_duration.total_seconds() % 3600) // 60)
+                duration_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+
+                msg = (
+                    f"🟢 <b>{machine_name} RUNNING again</b> — SSPPL\n\n"
+                    f"Back up at {now_ist.strftime('%d %b, %I:%M %p')} IST "
+                    f"(stopped for {duration_str})"
+                )
+                if MACHINE_STATE_CHAT_ID:
+                    send_alert(msg, chat_id=MACHINE_STATE_CHAT_ID)
+                    log.info("Machine recovery alert: %s after %s stopped", machine_name, duration_str)
+                else:
+                    log.warning(
+                        "Machine state alert chat not configured "
+                        "(TELEGRAM_MACHINE_STATE_CHAT_ID unset) — skipping send: %s", msg,
+                    )
+
+            _machine_run_state[machine_id] = (state, started_at)
+
+    except Exception as exc:
+        log.error("Error in check_machine_state_alerts: %s", exc)
+    finally:
+        db.close()
+
+
 def start_alert_scheduler() -> BackgroundScheduler:
     """
     Start the APScheduler background scheduler.
@@ -199,6 +331,18 @@ def start_alert_scheduler() -> BackgroundScheduler:
         next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30),
     )
 
+    # Machine stop/start check: every 60 seconds, offset 15 s from the other
+    # two jobs so all three don't hit the DB in the same instant
+    scheduler.add_job(
+        check_machine_state_alerts,
+        trigger="interval",
+        seconds=60,
+        id="machine_state_alert_check",
+        name="Machine stop/start alert checker",
+        misfire_grace_time=30,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=15),
+    )
+
     scheduler.start()
-    log.info("Alert scheduler started — gateway check and overcurrent check every 60s")
+    log.info("Alert scheduler started — gateway, overcurrent, and machine state checks every 60s")
     return scheduler
