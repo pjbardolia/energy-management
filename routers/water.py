@@ -31,7 +31,7 @@ component_type_id — a machine with no such component 404s.
 """
 
 import bisect
-from datetime import datetime, timedelta, timezone, date as date_type
+from datetime import datetime, timedelta, date as date_type
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -57,11 +57,23 @@ FLOW_TOTALIZER_TAG_KEY = "flow_totalizer"
 
 def _op_day_bounds_utc(op_date: date_type) -> tuple[datetime, datetime, datetime]:
     """Operational day (09:00 IST -> 09:00 IST next day) as UTC bounds, plus
-    the 21:00 IST shift-A/B split, all as tz-aware UTC datetimes."""
+    the 21:00 IST shift-A/B split.
+
+    Returned as NAIVE datetimes (no tzinfo), deliberately — telemetry_data.timestamp
+    is `TIMESTAMP WITHOUT TIME ZONE` (confirmed via \\d telemetry_data) storing
+    UTC-naive values, and psycopg2 hands rows back as naive datetime objects.
+    This file compares those row timestamps directly against these boundaries
+    in Python (_ReadingSeries.at_or_before(), the is_today/bucket checks below)
+    — mixing naive and tz-aware there raises "can't compare offset-naive and
+    offset-aware datetimes". Unlike machine_state_event (TIMESTAMPTZ, so
+    routers/machine_state.py's Python-side interval math is safely aware-vs-aware),
+    telemetry_data has no tzinfo to be aware of, so naive-UTC throughout is the
+    correct type to match here, not a workaround.
+    """
     start_ist = datetime(op_date.year, op_date.month, op_date.day, DAY_SHIFT_START_H, 0, 0)
     mid_ist   = datetime(op_date.year, op_date.month, op_date.day, DAY_SHIFT_END_H, 0, 0)
-    start_utc = start_ist.replace(tzinfo=timezone.utc) - IST_OFFSET
-    mid_utc   = mid_ist.replace(tzinfo=timezone.utc) - IST_OFFSET
+    start_utc = start_ist - IST_OFFSET
+    mid_utc   = mid_ist - IST_OFFSET
     end_utc   = start_utc + timedelta(hours=24)
     return start_utc, mid_utc, end_utc
 
@@ -188,7 +200,7 @@ def get_machine_water_consumption(
         raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD.")
 
     day_start, shift_split, day_end = _op_day_bounds_utc(op_date)
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.utcnow()  # naive UTC — matches telemetry_data.timestamp, see _op_day_bounds_utc()
     is_today = day_start <= now_utc < day_end
 
     series = _load_reading_series(
