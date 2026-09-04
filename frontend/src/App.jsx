@@ -662,7 +662,7 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
           <span style={{width:1,height:18,background:C.border}}/>
           {/* Fleet / Analytics tab pills */}
           <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }}>
-            {[['fleet', 'Fleet'], ['analytics', 'Analytics'], ['temperature', 'Temperature & Pressure'], ['uptime', 'Uptime']].map(([p, label]) => (
+            {[['fleet', 'Fleet'], ['analytics', 'Analytics'], ['temperature', 'Temperature & Pressure'], ['uptime', 'Uptime'], ['water', 'Water']].map(([p, label]) => (
               <button key={p} onClick={() => setActivePage(p)} style={{
                 background: activePage === p ? C.red : 'transparent',
                 color: activePage === p ? '#fff' : C.muted,
@@ -808,6 +808,11 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
         {/* Uptime tab — Gantt timeline, heatmap calendar, OEE availability cards */}
         {activePage === 'uptime' && (
           <UptimePage token={token} onLogout={onLogout} />
+        )}
+
+        {/* Water tab — flowmeter totalizer consumption */}
+        {activePage === 'water' && (
+          <WaterPage token={token} onLogout={onLogout} />
         )}
       </main>
     </div>
@@ -2071,6 +2076,214 @@ function TemperatureAndPressurePage({ token, onLogout }) {
             </div>
           )}
         </>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   WATER PAGE — flowmeter totalizer consumption. Eligibility-driven
+   machine selector (tags?.flow_totalizer != null), same pattern as
+   TemperatureAndPressurePage — no hardcoded Jet 11, so a future
+   flowmeter machine (e.g. Jet 12) appears automatically with no
+   frontend change. Calls the existing GET /machines/{id}/water/
+   consumption endpoint — no new backend work.
+═══════════════════════════════════════════════════════════════ */
+
+// Badge shown in place of a number whenever a window/bucket's status isn't
+// "ok". Reuses SensorReadingCard's amber STALE styling for "anomaly" (visual
+// consistency), but the wording deliberately does NOT say "gateway offline"
+// or similar — an anomaly here is a single implausible flowmeter reading
+// (torn read or meter reset) rejected by the backend's plausibility check,
+// not a live outage, and should not read with that urgency.
+function WaterStatusBadge({ status }) {
+  if (status === 'future') {
+    return (
+      <span style={{ background: '#f3f4f6', color: '#6b7280', padding: '4px 10px',
+        borderRadius: 6, fontSize: 12, fontWeight: 600 }}>
+        Not yet complete
+      </span>
+    );
+  }
+  if (status === 'no_data') {
+    return (
+      <span style={{ background: '#f3f4f6', color: '#6b7280', padding: '4px 10px',
+        borderRadius: 6, fontSize: 12, fontWeight: 600 }}>
+        No data
+      </span>
+    );
+  }
+  if (status === 'anomaly') {
+    return (
+      <span
+        title="A flowmeter reading used for this total looked implausible (e.g. a meter reset or a bad read) and was rejected — this is a data-quality flag, not a gateway outage. It resolves automatically once fresh readings are available."
+        style={{ background: '#fef3c7', color: '#92400e', padding: '4px 10px',
+          borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'help' }}
+      >
+        Anomaly (stale data, resolving automatically)
+      </span>
+    );
+  }
+  return null;
+}
+
+function WaterSummaryCard({ label, window }) {
+  return (
+    <div style={{
+      background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12,
+      padding: '20px 24px', flex: 1, minWidth: 180,
+    }}>
+      <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 10, fontWeight: 600 }}>
+        {label}
+      </div>
+      {window?.status === 'ok' ? (
+        <div style={{ fontSize: 28, fontWeight: 700, color: '#111827' }}>
+          {fmt(window.liters, 1)}
+          <span style={{ fontSize: 15, fontWeight: 400, marginLeft: 4, color: '#6b7280' }}>L</span>
+        </div>
+      ) : (
+        <div style={{ marginTop: 2 }}>
+          <WaterStatusBadge status={window?.status} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WaterPage({ token, onLogout }) {
+  // Fleet-wide live tags — same endpoint/pattern as TemperatureAndPressurePage,
+  // used only to build the eligible-machine list (machines with a flowmeter).
+  const [liveByMachine, setLiveByMachine] = useState([]);
+  const [selectedMachineId, setSelectedMachineId] = useState(null);
+  const [consumption, setConsumption] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  // Operational day default: if before 9am IST, "today" is still yesterday's
+  // operational day — identical snippet to TemperatureAndPressurePage's logDate default.
+  const opDate = (() => {
+    const now = new Date();
+    const istHour = (now.getUTCHours() + 5) % 24 + (now.getUTCMinutes() >= 30 ? 0.5 : 0);
+    const d = new Date(now);
+    if (istHour < 9) d.setDate(d.getDate() - 1);
+    return d.toISOString().slice(0, 10);
+  })();
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    const fetchLive = () => {
+      apiFetch('/machines/live', token)
+        .then(data => { if (!cancelled) setLiveByMachine(Array.isArray(data) ? data : []); })
+        .catch(() => {});
+    };
+    fetchLive();
+    const id = setInterval(fetchLive, POLL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [token]);
+
+  // Machines with a flow_totalizer tag — no hardcoded Jet 11.
+  const eligibleMachines = liveByMachine.filter(m => m.tags?.flow_totalizer != null);
+
+  useEffect(() => {
+    if (eligibleMachines.length === 0) return;
+    const stillEligible = eligibleMachines.some(m => m.machine_id === selectedMachineId);
+    if (selectedMachineId == null || !stillEligible) {
+      setSelectedMachineId(eligibleMachines[0].machine_id);
+    }
+    // eligibleMachines is derived fresh every render; comparing by id above
+    // keeps this from looping once a valid selection is set.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveByMachine, selectedMachineId]);
+
+  // Poll the consumption endpoint at the same cadence as the rest of the
+  // dashboard (POLL_MS) — this drives both the live "Since 9 AM" card and
+  // the four summary cards below it.
+  useEffect(() => {
+    if (!token || selectedMachineId == null) return;
+    let cancelled = false;
+    const fetchConsumption = () => {
+      apiFetch(`/machines/${selectedMachineId}/water/consumption?date=${opDate}`, token)
+        .then(data => { if (!cancelled) { setConsumption(data); setLoading(false); } })
+        .catch(() => { if (!cancelled) setLoading(false); });
+    };
+    setLoading(true);
+    fetchConsumption();
+    const id = setInterval(fetchConsumption, POLL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [token, selectedMachineId, opDate]);
+
+  const selectedMachine = liveByMachine.find(m => m.machine_id === selectedMachineId);
+  const sinceNow = consumption?.totals?.since_9am;
+
+  return (
+    <div style={{ padding: '24px 32px', maxWidth: 1200, margin: '0 auto' }}>
+
+      <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 16, color: '#1f2937' }}>
+        Water Consumption
+      </h2>
+
+      {/* Machine selector — lists every machine with a flowmeter */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 20 }}>
+        <span style={{ fontSize: 13, color: '#6b7280' }}>Machine:</span>
+        {eligibleMachines.length === 0 ? (
+          <span style={{ fontSize: 13, color: '#9ca3af' }}>No machines with a flowmeter yet.</span>
+        ) : (
+          <select
+            value={selectedMachineId ?? ''}
+            onChange={e => setSelectedMachineId(parseInt(e.target.value))}
+            style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #e5e7eb',
+              fontSize: 13, color: '#1f2937', fontWeight: 600 }}
+          >
+            {eligibleMachines.map(m => (
+              <option key={m.machine_id} value={m.machine_id}>{m.machine_name}</option>
+            ))}
+          </select>
+        )}
+      </div>
+
+      {selectedMachine && (
+        loading ? (
+          <div style={{ textAlign: 'center', padding: 60, color: '#9ca3af' }}>Loading water data…</div>
+        ) : !consumption ? (
+          <div style={{ textAlign: 'center', padding: 60, color: '#9ca3af' }}>No data available.</div>
+        ) : (
+          <>
+            {/* Live "Since 9 AM" card — the running total, auto-refreshing
+                with the rest of the dashboard (POLL_MS). */}
+            <div style={{
+              background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
+              padding: '32px 40px', marginBottom: 24,
+            }}>
+              <div style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 8 }}>
+                {selectedMachine.machine_name}
+              </div>
+              <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 4 }}>
+                Running Total — Since 9 AM
+              </div>
+              {sinceNow?.status === 'ok' ? (
+                <div style={{ fontSize: 56, fontWeight: 700, lineHeight: 1, color: '#dc2626', marginBottom: 4 }}>
+                  {fmt(sinceNow.liters, 1)}
+                  <span style={{ fontSize: 24, fontWeight: 400, marginLeft: 4 }}>L</span>
+                </div>
+              ) : (
+                <div style={{ marginTop: 8, marginBottom: 4 }}>
+                  <WaterStatusBadge status={sinceNow?.status} />
+                </div>
+              )}
+              <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 8 }}>
+                Operational day {consumption.date} (09:00 IST → now)
+              </div>
+            </div>
+
+            {/* Four fixed summary windows */}
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+              <WaterSummaryCard label="Since 9 AM"             window={consumption.totals?.since_9am} />
+              <WaterSummaryCard label="Shift A (09:00–21:00)"  window={consumption.totals?.shift_a} />
+              <WaterSummaryCard label="Shift B (21:00–09:00)"  window={consumption.totals?.shift_b} />
+              <WaterSummaryCard label="Full Day (24h)"         window={consumption.totals?.full_day} />
+            </div>
+          </>
+        )
       )}
     </div>
   );
