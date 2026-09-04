@@ -11,7 +11,7 @@ class WaterWindowTotal(BaseModel):
     window_start: datetime
     window_end:   datetime
     liters:       float | None   # None unless status == "ok"
-    status:       str            # "ok" | "no_data" | "anomaly"
+    status:       str            # "ok" | "future" | "no_data" | "anomaly"
 
     model_config = {"from_attributes": True}
 

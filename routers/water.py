@@ -131,7 +131,21 @@ def _load_reading_series(
     return _ReadingSeries(rows)
 
 
-def _window_total(series: _ReadingSeries, start: datetime, end: datetime) -> WaterWindowTotal:
+def _window_total(
+    series: _ReadingSeries, start: datetime, end: datetime, now_utc: datetime,
+) -> WaterWindowTotal:
+    # A fixed window (shift A/B, full day) isn't a real total until it's
+    # actually elapsed — otherwise "nearest reading at/before a boundary
+    # that's still in the future" silently resolves to whatever the latest
+    # reading happens to be, producing a misleading "ok" total (often 0.0,
+    # since start and end both land on that same latest reading) for a
+    # window that hasn't started, or a partial number passed off as
+    # complete for one that's only partway through. since_9am is exempt
+    # from this: its caller already caps `end` at now_utc for a live/partial
+    # total by design, so end > now_utc never happens for it.
+    if end > now_utc:
+        return WaterWindowTotal(window_start=start, window_end=end, liters=None, status="future")
+
     start_val = series.at_or_before(start)
     end_val   = series.at_or_before(end)
     if start_val is None or end_val is None:
@@ -210,10 +224,10 @@ def get_machine_water_consumption(
 
     since_9am_end = now_utc if is_today else day_end
     totals = WaterConsumptionTotals(
-        since_9am=_window_total(series, day_start, since_9am_end),
-        shift_a=_window_total(series, day_start, shift_split),
-        shift_b=_window_total(series, shift_split, day_end),
-        full_day=_window_total(series, day_start, day_end),
+        since_9am=_window_total(series, day_start, since_9am_end, now_utc),
+        shift_a=_window_total(series, day_start, shift_split, now_utc),
+        shift_b=_window_total(series, shift_split, day_end, now_utc),
+        full_day=_window_total(series, day_start, day_end, now_utc),
     )
 
     intervals: list[WaterIntervalBucket] = []
