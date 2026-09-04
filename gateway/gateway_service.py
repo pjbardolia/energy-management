@@ -20,6 +20,11 @@ hardware specs belong in code, deployment config belongs in config.json):
                      uint32 + float32, summed into one flow_totalizer value).
                      Requires ASCII framing + 7 data bits — see bus-level
                      "framer"/"bytesize" keys in config.json (Jet 11's bus).
+                     SUPERSEDED for Jet 11 by EUREKA_EU1000_RTU below (kept
+                     for rollback — see that spec's comment for why).
+  - EUREKA_EU1000_RTU : same physical meter, RTU mode (bench-confirmed
+                     2026-09-04) — single register pair at 1284, float32,
+                     totalizer only. Standard RTU framing, 8 data bits.
 
 Bus configuration (port, baudrate, devices list) lives in config.json under the
 "buses" array — add, remove, or reconfigure any bus without touching this file.
@@ -252,6 +257,31 @@ _EUREKA_EU1000_SPEC = {
     ],
 }
 
+# Eureka EU1000 — RTU-mode config, bench-confirmed 2026-09-04. Supersedes
+# _EUREKA_EU1000_SPEC for Jet 11 (kept above, unused, for rollback — the ASCII
+# spec was never verified against real flowing conditions and its own
+# torn-read history is unresolved; RTU mode may or may not share that issue).
+#
+# Serial (bus-level, config.json): 9600 baud, 8 data bits, No parity, 1 stop
+# bit, RTU framing. Slave address = 1.
+#
+# Register 1284 (2 regs, float32, LOW word first) = totalizer, function code
+# 03 (holding registers) — confirmed against the physical front-panel display:
+# decoded 12365.287 vs display's 12365.3.
+#
+# flow_instantaneous is deliberately OMITTED — not tested at any address on
+# this device, and we only need the totalizer. Only flow_totalizer is ever
+# written to the outbox; the intermediate _flow_totalizer_raw key never
+# leaves read_modbus() (folded/validated in the EU1000 post-processing step
+# below, same as the old spec's int/frac parts).
+_EUREKA_EU1000_RTU_SPEC = {
+    "address": 1284,
+    "count":   2,
+    "registers": [
+        ("_flow_totalizer_raw", 0, 1, "float32_lo_hi"),
+    ],
+}
+
 # Master lookup: vfd_model string (as used in config.json) → register spec.
 # YASKAWA_A1000 and YASKAWA_V1000 point to the same spec object — they are
 # kept as separate model names so the device list is self-documenting.
@@ -263,6 +293,7 @@ VFD_REGISTER_MAPS = {
     "DELTA_CP2000":     _DELTA_CP2000_SPEC,
     "ELECTROSIL_FX438": _ELECTROSIL_FX438_SPEC,
     "EUREKA_EU1000":    _EUREKA_EU1000_SPEC,
+    "EUREKA_EU1000_RTU": _EUREKA_EU1000_RTU_SPEC,
 }
 
 # Non-VFD device models handled by their own dedicated read function
@@ -933,12 +964,20 @@ def _decode_register(registers: list[int], reg_index: int, divisor: float, decod
             IEEE-754 float (word order confirmed against the Eureka EU1000's
             bench-tested totalizer fraction decode: high register first).
             divisor is ignored (must be 1 in the spec, kept for symmetry).
+        "float32_lo_hi" — same as "float32" but with the two registers
+            swapped before packing (low word first) — confirmed against the
+            Eureka EU1000's RTU-mode totalizer register (1284), which uses
+            the opposite word order from the ASCII-mode spec's frac part.
+            divisor is ignored (must be 1 in the spec).
         "uint32"  — (registers[reg_index] << 16) | registers[reg_index+1],
             i.e. a 32-bit unsigned long split across two registers, high
             word first. divisor is ignored (must be 1 in the spec).
     """
     if decode == "float32":
         packed = struct.pack(">HH", registers[reg_index], registers[reg_index + 1])
+        return struct.unpack(">f", packed)[0]
+    if decode == "float32_lo_hi":
+        packed = struct.pack(">HH", registers[reg_index + 1], registers[reg_index])
         return struct.unpack(">f", packed)[0]
     if decode == "uint32":
         return (registers[reg_index] << 16) | registers[reg_index + 1]
@@ -1085,19 +1124,34 @@ def read_modbus(
             decode = rest[0] if rest else "scaled_int"
             values[tag_name] = _decode_register(er.registers, reg_index, divisor, decode)
 
-    # Eureka EU1000: fold the two totalizer parts (now read together in one
-    # 4-register transaction — see _EUREKA_EU1000_SPEC) into one flow_totalizer
-    # value, then run it past a plausibility check before accepting it. Only
-    # flow_instantaneous and flow_totalizer are ever written to the outbox —
-    # the intermediate _flow_totalizer_int/_flow_totalizer_frac keys never
+    # Eureka EU1000 (either mode): fold the totalizer reading into one
+    # flow_totalizer value, then run it past a plausibility check before
+    # accepting it. Only flow_instantaneous and flow_totalizer are ever
+    # written to the outbox — the intermediate _flow_totalizer_* keys never
     # leave this function. If the read failed this cycle, the intermediate
     # keys are simply absent (per the non-fatal handling above) and
-    # flow_totalizer is skipped — flow_instantaneous is still returned untouched.
-    if vfd_model == "EUREKA_EU1000":
-        int_part = values.pop("_flow_totalizer_int", None)
-        frac_part = values.pop("_flow_totalizer_frac", None)
-        if int_part is not None and frac_part is not None:
-            candidate_total = int_part + frac_part
+    # flow_totalizer is skipped — flow_instantaneous (ASCII mode only) is
+    # still returned untouched.
+    #
+    # EUREKA_EU1000 (ASCII mode) reads int + frac parts in one 4-register
+    # transaction (see _EUREKA_EU1000_SPEC) and sums them. EUREKA_EU1000_RTU
+    # reads one complete float32 value directly (see _EUREKA_EU1000_RTU_SPEC)
+    # — nothing to fold, but it still goes through the same plausibility
+    # check below, since it's never been verified under real flowing
+    # conditions and may or may not share the ASCII spec's torn-read history.
+    if vfd_model in ("EUREKA_EU1000", "EUREKA_EU1000_RTU"):
+        if vfd_model == "EUREKA_EU1000":
+            int_part = values.pop("_flow_totalizer_int", None)
+            frac_part = values.pop("_flow_totalizer_frac", None)
+            candidate_total = (
+                int_part + frac_part
+                if int_part is not None and frac_part is not None
+                else None
+            )
+        else:
+            candidate_total = values.pop("_flow_totalizer_raw", None)
+
+        if candidate_total is not None:
             now = time.time()
             last = _last_totalizer_reading.get(component_instance_id)
 
@@ -1141,24 +1195,25 @@ def read_modbus(
                 # the gateway service after one.
                 if delta < 0:
                     log.warning(
-                        "Slave %d [EUREKA_EU1000]: totalizer decreased by %.2f L "
+                        "Slave %d [%s]: totalizer decreased by %.2f L "
                         "(torn read, or a genuine meter reset — see code comment) "
                         "— skipping flow_totalizer this cycle (last good: %.2f L)",
-                        slave_id, -delta, last_total,
+                        slave_id, vfd_model, -delta, last_total,
                     )
                 elif delta > max_plausible:
                     # Implausible jump — almost certainly a torn read (see
-                    # _EUREKA_EU1000_SPEC comment). Skip flow_totalizer this
-                    # cycle rather than write garbage; deliberately do NOT
-                    # update the cache, so the next reading is compared
-                    # against the same last-known-good value with a
-                    # correspondingly wider (still correct) plausible window.
+                    # _EUREKA_EU1000_SPEC / _EUREKA_EU1000_RTU_SPEC comments).
+                    # Skip flow_totalizer this cycle rather than write garbage;
+                    # deliberately do NOT update the cache, so the next
+                    # reading is compared against the same last-known-good
+                    # value with a correspondingly wider (still correct)
+                    # plausible window.
                     log.warning(
-                        "Slave %d [EUREKA_EU1000]: implausible totalizer jump "
+                        "Slave %d [%s]: implausible totalizer jump "
                         "%.2f L in %.1fs (max plausible %.2f L) — likely a "
                         "torn read, skipping flow_totalizer this cycle "
                         "(last good: %.2f L)",
-                        slave_id, delta, elapsed, max_plausible, last_total,
+                        slave_id, vfd_model, delta, elapsed, max_plausible, last_total,
                     )
                 else:
                     values["flow_totalizer"] = candidate_total
