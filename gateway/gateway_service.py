@@ -1221,18 +1221,30 @@ def read_modbus(
 
     return values
 
-def read_ai8ch_pressure(client: ModbusSerialClient, slave_id: int) -> dict | None:
-    """Read AI1 from a Waveshare Analog Input 8CH module (pressure transmitter).
+def read_ai8ch_pressure(client: ModbusSerialClient, slave_id: int, channel: int = 1) -> dict | None:
+    """Read one channel from a Waveshare Analog IN 8CH module (pressure transmitter).
 
     Unlike read_modbus(), this uses function code 04 (Read Input Registers),
     not 03 — a different Modbus operation, hence a separate function rather
     than a VFD_REGISTER_MAPS entry.
 
-    Register 0x0000, channel already configured (during commissioning) to
-    mode 3 (4-20mA), returns current directly in microamps.
+    Register = 0x0000 + (channel - 1) — e.g. channel=1 (AI1) reads 0x0000,
+    channel=2 (AI2) reads 0x0001. This mapping was confirmed 2026-09-04 by
+    physically probing each channel against live hardware
+    (ai8ch_channel_scan.py, same function code as this function) and
+    cross-checking against the on-site engineer's physical terminal labels
+    — AI1->Jet 27, AI2->Jet 25, AI3->Jet 26 — NOT assumed from a datasheet.
 
-    Transmitter: Baumer CTX3, rated 0-6 bar. Scaling verified via live bench
-    test 03 Aug 2026: 4mA = 0 kg/cm2 (confirmed on idle Jet 27).
+    channel defaults to 1 (AI1) so any config.json entry predating this
+    parameter keeps reading exactly what it always has — backward
+    compatible with Jet 27's original single-channel deployment and any
+    other site's AI8CH config that hasn't been updated yet.
+
+    Channel already configured (during commissioning) to mode 3 (4-20mA),
+    returns current directly in microamps, on every channel of this module
+    — same scaling for all three currently-wired channels (Jet 27/25/26 all
+    use identical Baumer CTX3 transmitters, 0-6 bar). Scaling verified via
+    live bench test 03 Aug 2026: 4mA = 0 kg/cm2 (confirmed on idle Jet 27).
 
     Returns dict with one key, "pressure" — same dict[str, float] contract
     as read_modbus(), so it plugs into the existing outbox-writing loop
@@ -1240,15 +1252,16 @@ def read_ai8ch_pressure(client: ModbusSerialClient, slave_id: int) -> dict | Non
     """
     RANGE_KGCM2 = 6.0 * 1.01972
     MA_MIN, MA_MAX = 4.0, 20.0
+    address = 0x0000 + (channel - 1)
 
     try:
-        rr = client.read_input_registers(address=0x0000, count=1, device_id=slave_id)
+        rr = client.read_input_registers(address=address, count=1, device_id=slave_id)
     except ModbusIOException as exc:
-        log.warning("Slave %d [WAVESHARE_AI8CH]: Modbus read failed: %s", slave_id, exc)
+        log.warning("Slave %d CH%d [WAVESHARE_AI8CH]: Modbus read failed: %s", slave_id, channel, exc)
         return None
 
     if rr.isError():
-        log.warning("Slave %d [WAVESHARE_AI8CH]: Modbus error response: %s", slave_id, rr)
+        log.warning("Slave %d CH%d [WAVESHARE_AI8CH]: Modbus error response: %s", slave_id, channel, rr)
         return None
 
     current_ma = rr.registers[0] / 1000.0
@@ -1327,7 +1340,7 @@ def _poll_bus(
             # check (see read_modbus()'s docstring) — harmless for every
             # other vfd_model.
             if vfd_model == "WAVESHARE_AI8CH":
-                values = read_ai8ch_pressure(client, slave_id)
+                values = read_ai8ch_pressure(client, slave_id, channel=device.get("channel", 1))
             else:
                 values = read_modbus(client, slave_id, vfd_model, component_instance_id=component_id)
 
