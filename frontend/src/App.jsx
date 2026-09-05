@@ -2150,6 +2150,91 @@ function WaterSummaryCard({ label, window }) {
   );
 }
 
+// Compare view's own, slower cadence. A side-by-side glance number doesn't
+// need the single-card's 10s freshness, and this keeps N-machine polling
+// cheap as more flowmeters get added later (today N=2) — each poll tick
+// still computes a full day-range scan + 48-bucket breakdown per machine
+// server-side even though Compare only displays one number, so a slower
+// cadence here is the cheap mitigation until/unless a dedicated
+// lightweight fleet endpoint is ever worth building.
+const COMPARE_POLL_MS = 30_000;
+
+function WaterCompareView({ token, eligibleMachines, opDate, onSelectMachine }) {
+  const [consumptionByMachine, setConsumptionByMachine] = useState({}); // machine_id -> response
+  const [loading, setLoading] = useState(true);
+
+  // Stable key so this effect only restarts when the actual set of eligible
+  // machine ids changes, not on every render (eligibleMachines is a fresh
+  // filtered array each time).
+  const machineIdsKey = eligibleMachines.map(m => m.machine_id).join(',');
+
+  useEffect(() => {
+    if (!token || eligibleMachines.length === 0) { setLoading(false); return; }
+    let cancelled = false;
+    const fetchAll = () => {
+      Promise.all(
+        eligibleMachines.map(m =>
+          apiFetch(`/machines/${m.machine_id}/water/consumption?date=${opDate}`, token)
+            .then(data => ({ machineId: m.machine_id, data }))
+            .catch(() => ({ machineId: m.machine_id, data: null }))
+        )
+      ).then(results => {
+        if (cancelled) return;
+        const next = {};
+        results.forEach(({ machineId, data }) => { next[machineId] = data; });
+        setConsumptionByMachine(next);
+        setLoading(false);
+      });
+    };
+    setLoading(true);
+    fetchAll();
+    const id = setInterval(fetchAll, COMPARE_POLL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, machineIdsKey, opDate]);
+
+  if (eligibleMachines.length === 0) {
+    return <div style={{ textAlign: 'center', padding: 60, color: '#9ca3af' }}>No machines with a flowmeter yet.</div>;
+  }
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 16 }}>
+      {eligibleMachines.map(m => {
+        const data = consumptionByMachine[m.machine_id];
+        const sinceNow = data?.totals?.since_9am;
+        return (
+          <div
+            key={m.machine_id}
+            onClick={() => onSelectMachine(m.machine_id)}
+            title="Click for full detail"
+            style={{
+              background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12,
+              padding: '20px 24px', cursor: 'pointer',
+            }}
+          >
+            <div style={{ fontSize: 15, fontWeight: 700, color: '#111827', marginBottom: 10 }}>
+              {m.machine_name}
+            </div>
+            <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 8, fontWeight: 600 }}>
+              Since 9 AM
+            </div>
+            {loading && !data ? (
+              <div style={{ fontSize: 13, color: '#9ca3af' }}>Loading…</div>
+            ) : sinceNow?.status === 'ok' ? (
+              <div style={{ fontSize: 28, fontWeight: 700, color: '#111827' }}>
+                {fmt(sinceNow.liters, 1)}
+                <span style={{ fontSize: 14, fontWeight: 400, marginLeft: 4, color: '#6b7280' }}>L</span>
+              </div>
+            ) : (
+              <WaterStatusBadge status={sinceNow?.status} />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function WaterPage({ token, onLogout }) {
   // Fleet-wide live tags — same endpoint/pattern as TemperatureAndPressurePage,
   // used only to build the eligible-machine list (machines with a flowmeter).
@@ -2157,6 +2242,7 @@ function WaterPage({ token, onLogout }) {
   const [selectedMachineId, setSelectedMachineId] = useState(null);
   const [consumption, setConsumption] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [viewMode, setViewMode] = useState('single'); // 'single' | 'compare'
 
   // Operational day default: if before 9am IST, "today" is still yesterday's
   // operational day — identical snippet to TemperatureAndPressurePage's logDate default.
@@ -2181,7 +2267,7 @@ function WaterPage({ token, onLogout }) {
     return () => { cancelled = true; clearInterval(id); };
   }, [token]);
 
-  // Machines with a flow_totalizer tag — no hardcoded Jet 11.
+  // Machines with a flow_totalizer tag — no hardcoded Jet 11 (or Jet 12).
   const eligibleMachines = liveByMachine.filter(m => m.tags?.flow_totalizer != null);
 
   useEffect(() => {
@@ -2197,9 +2283,12 @@ function WaterPage({ token, onLogout }) {
 
   // Poll the consumption endpoint at the same cadence as the rest of the
   // dashboard (POLL_MS) — this drives both the live "Since 9 AM" card and
-  // the four summary cards below it.
+  // the four summary cards below it. Only runs in Single Machine view —
+  // Compare view fetches every eligible machine independently on its own
+  // (slower) cadence, so this would otherwise double-poll whichever machine
+  // happens to be selected while the user is looking at Compare instead.
   useEffect(() => {
-    if (!token || selectedMachineId == null) return;
+    if (!token || selectedMachineId == null || viewMode !== 'single') return;
     let cancelled = false;
     const fetchConsumption = () => {
       apiFetch(`/machines/${selectedMachineId}/water/consumption?date=${opDate}`, token)
@@ -2210,10 +2299,18 @@ function WaterPage({ token, onLogout }) {
     fetchConsumption();
     const id = setInterval(fetchConsumption, POLL_MS);
     return () => { cancelled = true; clearInterval(id); };
-  }, [token, selectedMachineId, opDate]);
+  }, [token, selectedMachineId, opDate, viewMode]);
 
   const selectedMachine = liveByMachine.find(m => m.machine_id === selectedMachineId);
   const sinceNow = consumption?.totals?.since_9am;
+
+  // Compare view card click -> jump straight into Single Machine view for
+  // that machine, so Compare is a glance that naturally leads into detail
+  // rather than a dead end.
+  const handleSelectFromCompare = (machineId) => {
+    setSelectedMachineId(machineId);
+    setViewMode('single');
+  };
 
   return (
     <div style={{ padding: '24px 32px', maxWidth: 1200, margin: '0 auto' }}>
@@ -2222,68 +2319,92 @@ function WaterPage({ token, onLogout }) {
         Water Consumption
       </h2>
 
-      {/* Machine selector — lists every machine with a flowmeter */}
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 20 }}>
-        <span style={{ fontSize: 13, color: '#6b7280' }}>Machine:</span>
-        {eligibleMachines.length === 0 ? (
-          <span style={{ fontSize: 13, color: '#9ca3af' }}>No machines with a flowmeter yet.</span>
-        ) : (
-          <select
-            value={selectedMachineId ?? ''}
-            onChange={e => setSelectedMachineId(parseInt(e.target.value))}
-            style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #e5e7eb',
-              fontSize: 13, color: '#1f2937', fontWeight: 600 }}
-          >
-            {eligibleMachines.map(m => (
-              <option key={m.machine_id} value={m.machine_id}>{m.machine_name}</option>
-            ))}
-          </select>
-        )}
+      {/* Single Machine / Compare toggle — same pill pattern as UptimePage's view switcher */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 20 }}>
+        {[['single', 'Single Machine'], ['compare', 'Compare']].map(([val, label]) => (
+          <button key={val} onClick={() => setViewMode(val)} style={{
+            padding: '6px 16px', borderRadius: 6, fontSize: 13,
+            background: viewMode === val ? C.red : 'transparent',
+            color:      viewMode === val ? '#fff' : '#6b7280',
+            border:     `1px solid ${viewMode === val ? C.red : '#e5e7eb'}`,
+            cursor: 'pointer', fontWeight: viewMode === val ? 600 : 400,
+          }}>{label}</button>
+        ))}
       </div>
 
-      {selectedMachine && (
-        loading ? (
-          <div style={{ textAlign: 'center', padding: 60, color: '#9ca3af' }}>Loading water data…</div>
-        ) : !consumption ? (
-          <div style={{ textAlign: 'center', padding: 60, color: '#9ca3af' }}>No data available.</div>
-        ) : (
-          <>
-            {/* Live "Since 9 AM" card — the running total, auto-refreshing
-                with the rest of the dashboard (POLL_MS). */}
-            <div style={{
-              background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
-              padding: '32px 40px', marginBottom: 24,
-            }}>
-              <div style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 8 }}>
-                {selectedMachine.machine_name}
-              </div>
-              <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 4 }}>
-                Running Total — Since 9 AM
-              </div>
-              {sinceNow?.status === 'ok' ? (
-                <div style={{ fontSize: 56, fontWeight: 700, lineHeight: 1, color: '#dc2626', marginBottom: 4 }}>
-                  {fmt(sinceNow.liters, 1)}
-                  <span style={{ fontSize: 24, fontWeight: 400, marginLeft: 4 }}>L</span>
-                </div>
-              ) : (
-                <div style={{ marginTop: 8, marginBottom: 4 }}>
-                  <WaterStatusBadge status={sinceNow?.status} />
-                </div>
-              )}
-              <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 8 }}>
-                Operational day {consumption.date} (09:00 IST → now)
-              </div>
-            </div>
+      {viewMode === 'compare' ? (
+        <WaterCompareView
+          token={token}
+          eligibleMachines={eligibleMachines}
+          opDate={opDate}
+          onSelectMachine={handleSelectFromCompare}
+        />
+      ) : (
+        <>
+          {/* Machine selector — lists every machine with a flowmeter */}
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 20 }}>
+            <span style={{ fontSize: 13, color: '#6b7280' }}>Machine:</span>
+            {eligibleMachines.length === 0 ? (
+              <span style={{ fontSize: 13, color: '#9ca3af' }}>No machines with a flowmeter yet.</span>
+            ) : (
+              <select
+                value={selectedMachineId ?? ''}
+                onChange={e => setSelectedMachineId(parseInt(e.target.value))}
+                style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #e5e7eb',
+                  fontSize: 13, color: '#1f2937', fontWeight: 600 }}
+              >
+                {eligibleMachines.map(m => (
+                  <option key={m.machine_id} value={m.machine_id}>{m.machine_name}</option>
+                ))}
+              </select>
+            )}
+          </div>
 
-            {/* Four fixed summary windows */}
-            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-              <WaterSummaryCard label="Since 9 AM"             window={consumption.totals?.since_9am} />
-              <WaterSummaryCard label="Shift A (09:00–21:00)"  window={consumption.totals?.shift_a} />
-              <WaterSummaryCard label="Shift B (21:00–09:00)"  window={consumption.totals?.shift_b} />
-              <WaterSummaryCard label="Full Day (24h)"         window={consumption.totals?.full_day} />
-            </div>
-          </>
-        )
+          {selectedMachine && (
+            loading ? (
+              <div style={{ textAlign: 'center', padding: 60, color: '#9ca3af' }}>Loading water data…</div>
+            ) : !consumption ? (
+              <div style={{ textAlign: 'center', padding: 60, color: '#9ca3af' }}>No data available.</div>
+            ) : (
+              <>
+                {/* Live "Since 9 AM" card — the running total, auto-refreshing
+                    with the rest of the dashboard (POLL_MS). */}
+                <div style={{
+                  background: '#fff', border: '1px solid #e5e7eb', borderRadius: 16,
+                  padding: '32px 40px', marginBottom: 24,
+                }}>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 8 }}>
+                    {selectedMachine.machine_name}
+                  </div>
+                  <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 4 }}>
+                    Running Total — Since 9 AM
+                  </div>
+                  {sinceNow?.status === 'ok' ? (
+                    <div style={{ fontSize: 56, fontWeight: 700, lineHeight: 1, color: '#dc2626', marginBottom: 4 }}>
+                      {fmt(sinceNow.liters, 1)}
+                      <span style={{ fontSize: 24, fontWeight: 400, marginLeft: 4 }}>L</span>
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 8, marginBottom: 4 }}>
+                      <WaterStatusBadge status={sinceNow?.status} />
+                    </div>
+                  )}
+                  <div style={{ fontSize: 12, color: '#9ca3af', marginTop: 8 }}>
+                    Operational day {consumption.date} (09:00 IST → now)
+                  </div>
+                </div>
+
+                {/* Four fixed summary windows */}
+                <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+                  <WaterSummaryCard label="Since 9 AM"             window={consumption.totals?.since_9am} />
+                  <WaterSummaryCard label="Shift A (09:00–21:00)"  window={consumption.totals?.shift_a} />
+                  <WaterSummaryCard label="Shift B (21:00–09:00)"  window={consumption.totals?.shift_b} />
+                  <WaterSummaryCard label="Full Day (24h)"         window={consumption.totals?.full_day} />
+                </div>
+              </>
+            )
+          )}
+        </>
       )}
     </div>
   );
