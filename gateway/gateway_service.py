@@ -269,6 +269,17 @@ _EUREKA_EU1000_SPEC = {
 # 03 (holding registers) — confirmed against the physical front-panel display:
 # decoded 12365.287 vs display's 12365.3.
 #
+# UNIT MISMATCH (found 2026-09-05, fixed same day): the physical display
+# shows this value in CUBIC METERS ("12365.3 m3"), not liters — confirmed
+# by direct observation of the display's own unit label, not assumed. But
+# tag_definition_id=11 ("flow_totalizer") is unit='L' (confirmed live DB
+# query, matches migration 007). The raw register value is therefore
+# multiplied by 1000 in read_modbus()'s EU1000 post-processing step before
+# it is ever stored, so every downstream consumer (DB, /water/consumption,
+# the Water tab) receives correct liters — this is written down explicitly
+# here so it isn't lost again, unlike the original spec above which never
+# recorded the display's unit at all.
+#
 # flow_instantaneous is deliberately OMITTED — not tested at any address on
 # this device, and we only need the totalizer. Only flow_totalizer is ever
 # written to the outbox; the intermediate _flow_totalizer_raw key never
@@ -279,6 +290,39 @@ _EUREKA_EU1000_RTU_SPEC = {
     "count":   2,
     "registers": [
         ("_flow_totalizer_raw", 0, 1, "float32_lo_hi"),
+    ],
+}
+
+# Arrowmech AEFM-100 electromagnetic flowmeter (Jet 12 water meter — same
+# physical bus as Jet 11, /dev/ttyUSB2, RTU, 9600 8-N-1, but slave_id=2).
+#
+# Register 1280 (2 regs, uint32, LOW word first) = totalizer, function code
+# 03 (holding registers) — confirmed against the physical front-panel
+# display: decoded 12758796 vs display's "+12758795.4L" (off by <1, expected
+# truncation of the .4 fraction — this meter's totalizer is a plain
+# integer, unlike the old Eureka's int+frac split or Jet 11 RTU's float32).
+#
+# UNIT: the display explicitly shows LITERS ("...4L"), unlike Jet 11's
+# meter (which explicitly showed m3, requiring the x1000 conversion in
+# _EUREKA_EU1000_RTU_SPEC's post-processing). No conversion is applied here
+# — this is a working hypothesis based on the display's own unit label, not
+# yet independently verified the way Jet 11's mismatch was. Compare the
+# first few stored values against a fresh physical reading once this is
+# live before treating it as settled.
+#
+# No plausibility check (unlike EUREKA_EU1000/EUREKA_EU1000_RTU): that
+# check exists specifically for the old Eureka's confirmed torn-read
+# mechanism (register instability under active flow, tied to its split
+# int/frac register architecture). This meter uses a different, simpler
+# single-register uint32 read with no evidence of a similar problem —
+# deliberately not building protection for a failure mode with no evidence
+# yet. Watch this closely once real flow happens; add a check later if a
+# real problem shows up.
+_ARROWMECH_AEFM100_SPEC = {
+    "address": 1280,
+    "count":   2,
+    "registers": [
+        ("flow_totalizer", 0, 1, "uint32_lo_hi"),
     ],
 }
 
@@ -294,6 +338,7 @@ VFD_REGISTER_MAPS = {
     "ELECTROSIL_FX438": _ELECTROSIL_FX438_SPEC,
     "EUREKA_EU1000":    _EUREKA_EU1000_SPEC,
     "EUREKA_EU1000_RTU": _EUREKA_EU1000_RTU_SPEC,
+    "ARROWMECH_AEFM100": _ARROWMECH_AEFM100_SPEC,
 }
 
 # Non-VFD device models handled by their own dedicated read function
@@ -972,6 +1017,11 @@ def _decode_register(registers: list[int], reg_index: int, divisor: float, decod
         "uint32"  — (registers[reg_index] << 16) | registers[reg_index+1],
             i.e. a 32-bit unsigned long split across two registers, high
             word first. divisor is ignored (must be 1 in the spec).
+        "uint32_lo_hi" — same as "uint32" but with the two registers
+            swapped (low word first) — confirmed against the Arrowmech
+            AEFM-100's totalizer register (1280, Jet 12), which uses the
+            opposite word order from every other uint32 spec in this file.
+            divisor is ignored (must be 1 in the spec).
     """
     if decode == "float32":
         packed = struct.pack(">HH", registers[reg_index], registers[reg_index + 1])
@@ -981,6 +1031,8 @@ def _decode_register(registers: list[int], reg_index: int, divisor: float, decod
         return struct.unpack(">f", packed)[0]
     if decode == "uint32":
         return (registers[reg_index] << 16) | registers[reg_index + 1]
+    if decode == "uint32_lo_hi":
+        return (registers[reg_index + 1] << 16) | registers[reg_index]
     return registers[reg_index] / divisor
 
 
@@ -1150,6 +1202,16 @@ def read_modbus(
             )
         else:
             candidate_total = values.pop("_flow_totalizer_raw", None)
+            # RTU-mode register 1284 stores cubic meters, but
+            # tag_definition_id=11 ("flow_totalizer") is unit='L' — see
+            # _EUREKA_EU1000_RTU_SPEC's comment for the discovery. Convert
+            # BEFORE the plausibility check below so the rate-ceiling
+            # comparison (_EU1000_MAX_PLAUSIBLE_RATE_L_PER_SEC, defined in
+            # L/s) actually compares like units — pre-conversion it was
+            # comparing an L/s threshold against m3-scale deltas, making it
+            # ~1000x more lenient than intended for this meter.
+            if candidate_total is not None:
+                candidate_total = candidate_total * 1000
 
         if candidate_total is not None:
             now = time.time()

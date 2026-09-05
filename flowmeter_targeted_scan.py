@@ -37,7 +37,7 @@ PORT = "/dev/ttyUSB2"          # update per which meter's port you're on
 FRAMING = "rtu"                 # confirmed for Jet 11 last round
 BAUD = 9600
 BYTESIZE, PARITY, STOPBITS = 8, "N", 1
-SLAVE_ID = 1                    # confirmed responsive last round
+SLAVE_ID = 2                    # confirmed responsive last round
 
 # SET THIS to whichever meter you're currently scanning:
 TOTALIZER_TARGET = 12365.3      # Jet 11 = 12365.3 (m3) | Jet 12 = 12535414.0 (L)
