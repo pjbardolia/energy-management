@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import {
   AreaChart, Area,
   LineChart, Line,
+  BarChart, Bar, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from "recharts";
 
@@ -2235,6 +2236,190 @@ function WaterCompareView({ token, eligibleMachines, opDate, onSelectMachine }) 
   );
 }
 
+// Report view's status -> color/label mapping. "ok" reuses the brand red
+// used for liters everywhere else in the Water tab; the other three share
+// the same neutral/amber split as WaterStatusBadge for visual consistency.
+const REPORT_STATUS_COLORS = { ok: C.red, future: '#d1d5db', no_data: '#d1d5db', anomaly: '#f59e0b' };
+const REPORT_STATUS_LABELS = { future: 'Not yet complete', no_data: 'No data', anomaly: 'Anomaly' };
+
+// Period label formatting — reuses the same "+Z then format in IST" idiom
+// already established by fmtIST24/toIST elsewhere in this file, since the
+// API returns naive-UTC timestamps with no trailing Z.
+function fmtPeriodLabel(value, granularity) {
+  if (!value) return '—';
+  const d = new Date(value.endsWith('Z') ? value : value + 'Z');
+  if (granularity === 'yearly') {
+    return d.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata', year: 'numeric' });
+  }
+  if (granularity === 'monthly') {
+    return d.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata', month: 'short', year: 'numeric' });
+  }
+  return d.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' });
+}
+
+function WaterReportView({ token, eligibleMachines }) {
+  const [machineId, setMachineId]   = useState(null);
+  const [granularity, setGranularity] = useState('daily');
+  const [startDate, setStartDate]   = useState(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 30);
+    return d.toISOString().slice(0, 10);
+  });
+  const [endDate, setEndDate]       = useState(() => new Date().toISOString().slice(0, 10));
+  const [report, setReport]         = useState(null);
+  const [loading, setLoading]       = useState(false);
+  const [error, setError]           = useState(null);
+
+  useEffect(() => {
+    if (eligibleMachines.length === 0) return;
+    const stillEligible = eligibleMachines.some(m => m.machine_id === machineId);
+    if (machineId == null || !stillEligible) {
+      setMachineId(eligibleMachines[0].machine_id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eligibleMachines, machineId]);
+
+  useEffect(() => {
+    if (!token || machineId == null) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    apiFetch(`/machines/${machineId}/water/report?granularity=${granularity}&start=${startDate}&end=${endDate}`, token)
+      .then(data => { if (!cancelled) { setReport(data); setLoading(false); } })
+      .catch(e => { if (!cancelled) { setError(e.message || 'Failed to load report'); setLoading(false); } });
+    return () => { cancelled = true; };
+  }, [token, machineId, granularity, startDate, endDate]);
+
+  function downloadPdf() {
+    const url = `/api/machines/${machineId}/water/report/pdf?granularity=${granularity}&start=${startDate}&end=${endDate}`;
+    fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+      .then(res => res.blob())
+      .then(blob => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        const slug = (eligibleMachines.find(m => m.machine_id === machineId)?.machine_name || 'machine')
+          .toLowerCase().replace(/\s+/g, '-');
+        a.download = `mevion-${slug}-water-report-${granularity}-${startDate}-${endDate}.pdf`;
+        a.click();
+      });
+  }
+
+  // Non-"ok" periods plot as a 0-height bar in the status color rather than
+  // a gap, so a run of "no_data"/"anomaly" periods is visually obvious next
+  // to real consumption bars instead of silently looking like a missing tick.
+  const chartData = (report?.periods || []).map(p => ({
+    label: fmtPeriodLabel(p.period_start, granularity),
+    liters: p.status === 'ok' ? p.liters : 0,
+    status: p.status,
+  }));
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 20 }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <span style={{ fontSize: 13, color: '#6b7280' }}>Machine:</span>
+          {eligibleMachines.length === 0 ? (
+            <span style={{ fontSize: 13, color: '#9ca3af' }}>No machines with a flowmeter yet.</span>
+          ) : (
+            <select
+              value={machineId ?? ''}
+              onChange={e => setMachineId(parseInt(e.target.value))}
+              style={{ padding: '6px 12px', borderRadius: 6, border: '1px solid #e5e7eb', fontSize: 13, fontWeight: 600 }}
+            >
+              {eligibleMachines.map(m => (
+                <option key={m.machine_id} value={m.machine_id}>{m.machine_name}</option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        <div style={{ display: 'flex', gap: 4 }}>
+          {[['daily', 'Day'], ['weekly', 'Week'], ['monthly', 'Month'], ['yearly', 'Year']].map(([val, label]) => (
+            <button key={val} onClick={() => setGranularity(val)} style={{
+              padding: '5px 14px', borderRadius: 6, fontSize: 13,
+              background: granularity === val ? C.red : 'transparent',
+              color:      granularity === val ? '#fff' : '#6b7280',
+              border:     `1px solid ${granularity === val ? C.red : '#e5e7eb'}`,
+              cursor: 'pointer', fontWeight: granularity === val ? 600 : 400,
+            }}>{label}</button>
+          ))}
+        </div>
+
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <span style={{ fontSize: 13, color: '#6b7280' }}>From</span>
+          <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)}
+            style={{ padding: '5px 8px', borderRadius: 6, border: '1px solid #e5e7eb', fontSize: 13 }} />
+          <span style={{ fontSize: 13, color: '#6b7280' }}>To</span>
+          <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)}
+            style={{ padding: '5px 8px', borderRadius: 6, border: '1px solid #e5e7eb', fontSize: 13 }} />
+        </div>
+
+        <button onClick={downloadPdf} disabled={!report || report.periods.length === 0} style={{
+          padding: '6px 16px', borderRadius: 6, fontSize: 13, fontWeight: 600,
+          background: '#fff', color: C.red, border: `1px solid ${C.red}`,
+          cursor: (report && report.periods.length > 0) ? 'pointer' : 'not-allowed',
+          opacity: (report && report.periods.length > 0) ? 1 : 0.5,
+        }}>Download PDF</button>
+      </div>
+
+      {eligibleMachines.length === 0 ? null : loading ? (
+        <div style={{ textAlign: 'center', padding: 60, color: '#9ca3af' }}>Loading report…</div>
+      ) : error ? (
+        <div style={{ textAlign: 'center', padding: 60, color: C.red }}>{error}</div>
+      ) : !report || report.periods.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: 60, color: '#9ca3af' }}>No periods in this range.</div>
+      ) : (
+        <>
+          <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: '20px 24px', marginBottom: 20 }}>
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={chartData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f3f4f6" />
+                <XAxis dataKey="label" tick={{ fontSize: 11 }} />
+                <YAxis tick={{ fontSize: 11 }} label={{ value: 'Liters', angle: -90, position: 'insideLeft', fontSize: 11 }} />
+                <Tooltip formatter={(value, name, props) => {
+                  const status = props.payload.status;
+                  if (status !== 'ok') return [REPORT_STATUS_LABELS[status] || status, 'Status'];
+                  return [`${fmt(value, 1)} L`, 'Consumption'];
+                }} />
+                <Bar dataKey="liters">
+                  {chartData.map((entry, i) => (
+                    <Cell key={i} fill={REPORT_STATUS_COLORS[entry.status] || REPORT_STATUS_COLORS.ok} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, overflow: 'hidden' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <thead>
+                <tr style={{ background: '#f9fafb' }}>
+                  <th style={{ padding: '10px 16px', textAlign: 'left', color: '#6b7280', fontWeight: 600 }}>Period</th>
+                  <th style={{ padding: '10px 16px', textAlign: 'right', color: '#6b7280', fontWeight: 600 }}>Consumption</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.periods.map((p, i) => (
+                  <tr key={i} style={{ borderTop: '1px solid #f3f4f6' }}>
+                    <td style={{ padding: '10px 16px' }}>{fmtPeriodLabel(p.period_start, granularity)}</td>
+                    <td style={{ padding: '10px 16px', textAlign: 'right' }}>
+                      {p.status === 'ok' ? (
+                        <span style={{ fontWeight: 600 }}>{fmt(p.liters, 1)} L</span>
+                      ) : (
+                        <WaterStatusBadge status={p.status} />
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function WaterPage({ token, onLogout }) {
   // Fleet-wide live tags — same endpoint/pattern as TemperatureAndPressurePage,
   // used only to build the eligible-machine list (machines with a flowmeter).
@@ -2319,9 +2504,9 @@ function WaterPage({ token, onLogout }) {
         Water Consumption
       </h2>
 
-      {/* Single Machine / Compare toggle — same pill pattern as UptimePage's view switcher */}
+      {/* Single Machine / Compare / Report toggle — same pill pattern as UptimePage's view switcher */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 20 }}>
-        {[['single', 'Single Machine'], ['compare', 'Compare']].map(([val, label]) => (
+        {[['single', 'Single Machine'], ['compare', 'Compare'], ['report', 'Report']].map(([val, label]) => (
           <button key={val} onClick={() => setViewMode(val)} style={{
             padding: '6px 16px', borderRadius: 6, fontSize: 13,
             background: viewMode === val ? C.red : 'transparent',
@@ -2338,6 +2523,11 @@ function WaterPage({ token, onLogout }) {
           eligibleMachines={eligibleMachines}
           opDate={opDate}
           onSelectMachine={handleSelectFromCompare}
+        />
+      ) : viewMode === 'report' ? (
+        <WaterReportView
+          token={token}
+          eligibleMachines={eligibleMachines}
         />
       ) : (
         <>

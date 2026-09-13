@@ -43,3 +43,27 @@ class WaterConsumptionResponse(BaseModel):
     intervals:    list[WaterIntervalBucket]
 
     model_config = {"from_attributes": True}
+
+
+class WaterReportPeriod(BaseModel):
+    """Consumption over one daily/weekly/monthly/yearly period. An
+    in-progress period is always "future" — unlike WaterConsumptionTotals'
+    since_9am, a report never shows a live/partial number, since a report
+    implies completed periods."""
+    period_start: datetime
+    period_end:   datetime
+    liters:       float | None   # None unless status == "ok"
+    status:       str            # "ok" | "future" | "no_data" | "anomaly"
+
+    model_config = {"from_attributes": True}
+
+
+class WaterReportResponse(BaseModel):
+    machine_id:   int
+    machine_name: str
+    granularity:  str   # "daily" | "weekly" | "monthly" | "yearly"
+    start:        str
+    end:          str
+    periods:      list[WaterReportPeriod]
+
+    model_config = {"from_attributes": True}

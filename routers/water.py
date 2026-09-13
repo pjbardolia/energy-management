@@ -31,9 +31,11 @@ component_type_id — a machine with no such component 404s.
 """
 
 import bisect
+import io
 from datetime import datetime, timedelta, date as date_type
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -43,6 +45,8 @@ from schemas.water import (
     WaterConsumptionTotals,
     WaterIntervalBucket,
     WaterConsumptionResponse,
+    WaterReportPeriod,
+    WaterReportResponse,
 )
 
 router = APIRouter(prefix="/machines", tags=["water"])
@@ -53,6 +57,9 @@ DAY_SHIFT_END_H   = 21   # 21:00 IST
 BUCKET_MINUTES    = 30
 
 FLOW_TOTALIZER_TAG_KEY = "flow_totalizer"
+
+VALID_REPORT_GRANULARITIES = {"daily", "weekly", "monthly", "yearly"}
+MAX_REPORT_PERIODS = 500  # same defensive-cap spirit as energy.py's 366-day range check
 
 
 def _op_day_bounds_utc(op_date: date_type) -> tuple[datetime, datetime, datetime]:
@@ -131,6 +138,95 @@ def _load_reading_series(
     return _ReadingSeries(rows)
 
 
+def _get_machine(db: Session, company_id: int, machine_id: int):
+    return db.execute(
+        text("SELECT id, name FROM machine WHERE id = :machine_id AND company_id = :company_id"),
+        {"machine_id": machine_id, "company_id": company_id},
+    ).mappings().first()
+
+
+def _get_flowmeter(db: Session, company_id: int, machine_id: int):
+    """Resolve "the flowmeter on this machine" as whichever component
+    instance produces the flow_totalizer tag — not a hardcoded
+    component_type_id, so this works for any future machine with a
+    flowmeter, not just Jet 11/Jet 12. Shared by every endpoint in this
+    file that needs a machine's flowmeter (consumption, report, report PDF)."""
+    return db.execute(text("""
+        SELECT ci.id AS component_instance_id, td.id AS tag_definition_id
+        FROM machine_component_instance ci
+        JOIN component_type_tag ctt
+          ON ctt.component_type_id = ci.component_type_id
+         AND ctt.company_id        = ci.company_id
+        JOIN tag_definition td
+          ON td.id = ctt.tag_definition_id
+        WHERE ci.machine_id  = :machine_id
+          AND ci.company_id  = :company_id
+          AND td.key         = :tag_key
+        LIMIT 1
+    """), {
+        "machine_id": machine_id, "company_id": company_id, "tag_key": FLOW_TOTALIZER_TAG_KEY,
+    }).mappings().first()
+
+
+def _ist_9am_utc(d: date_type) -> datetime:
+    """Naive-UTC instant for 09:00 IST on calendar date d — the single
+    boundary every period type (day/week/month/year) below is anchored to,
+    so periods always tile as a whole number of operational days with no
+    gaps or overlaps. Same math as _op_day_bounds_utc()'s start_utc, factored
+    out as a single boundary rather than a (start, mid, end) triple."""
+    ist = datetime(d.year, d.month, d.day, DAY_SHIFT_START_H, 0, 0)
+    return ist - IST_OFFSET
+
+
+def _period_boundaries(granularity: str, start_date: date_type, end_date: date_type):
+    """Yield (period_start_utc, period_end_utc) naive-UTC pairs covering
+    [start_date, end_date] at the given granularity. Every boundary is a
+    09:00 IST instant (_ist_9am_utc) so every period is a whole number of
+    operational days, exactly like the daily view's own day_start/day_end.
+
+    granularity:
+        "daily"   — one operational day per period (same boundary as
+            /water/consumption).
+        "weekly"  — Monday-start ISO week, snapped back to the Monday
+            on/before start_date. NEW CONVENTION — no prior precedent
+            exists anywhere in this codebase (checked: only rolling
+            trailing-7-day windows exist, e.g. OEECardsView's "This Week"
+            toggle in App.jsx, which is not a calendar week).
+        "monthly" — calendar month, 1st-of-month to 1st-of-next-month.
+            NEW CONVENTION, same caveat.
+        "yearly"  — calendar year, Jan 1 to Jan 1. NEW CONVENTION, same
+            caveat.
+    """
+    if granularity == "daily":
+        d = start_date
+        while d <= end_date:
+            yield _ist_9am_utc(d), _ist_9am_utc(d + timedelta(days=1))
+            d += timedelta(days=1)
+
+    elif granularity == "weekly":
+        d = start_date - timedelta(days=start_date.weekday())  # snap back to Monday
+        while d <= end_date:
+            nxt = d + timedelta(days=7)
+            yield _ist_9am_utc(d), _ist_9am_utc(nxt)
+            d = nxt
+
+    elif granularity == "monthly":
+        y, m = start_date.year, start_date.month
+        while date_type(y, m, 1) <= end_date:
+            ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+            yield _ist_9am_utc(date_type(y, m, 1)), _ist_9am_utc(date_type(ny, nm, 1))
+            y, m = ny, nm
+
+    elif granularity == "yearly":
+        y = start_date.year
+        while date_type(y, 1, 1) <= end_date:
+            yield _ist_9am_utc(date_type(y, 1, 1)), _ist_9am_utc(date_type(y + 1, 1, 1))
+            y += 1
+
+    else:
+        raise ValueError(f"Unknown granularity: {granularity}")
+
+
 def _window_total(
     series: _ReadingSeries, start: datetime, end: datetime, now_utc: datetime,
 ) -> WaterWindowTotal:
@@ -180,31 +276,11 @@ def get_machine_water_consumption(
     """
     company_id = current_user["company_id"]
 
-    machine = db.execute(
-        text("SELECT id, name FROM machine WHERE id = :machine_id AND company_id = :company_id"),
-        {"machine_id": machine_id, "company_id": company_id},
-    ).mappings().first()
+    machine = _get_machine(db, company_id, machine_id)
     if machine is None:
         raise HTTPException(404, f"Machine {machine_id} not found.")
 
-    # Resolve "the flowmeter on this machine" as whichever component instance
-    # produces the flow_totalizer tag — not a hardcoded component_type_id, so
-    # this works for any future machine with a flowmeter, not just Jet 11.
-    flowmeter = db.execute(text("""
-        SELECT ci.id AS component_instance_id, td.id AS tag_definition_id
-        FROM machine_component_instance ci
-        JOIN component_type_tag ctt
-          ON ctt.component_type_id = ci.component_type_id
-         AND ctt.company_id        = ci.company_id
-        JOIN tag_definition td
-          ON td.id = ctt.tag_definition_id
-        WHERE ci.machine_id  = :machine_id
-          AND ci.company_id  = :company_id
-          AND td.key         = :tag_key
-        LIMIT 1
-    """), {
-        "machine_id": machine_id, "company_id": company_id, "tag_key": FLOW_TOTALIZER_TAG_KEY,
-    }).mappings().first()
+    flowmeter = _get_flowmeter(db, company_id, machine_id)
     if flowmeter is None:
         raise HTTPException(404, f"Machine {machine_id} has no flowmeter component.")
 
@@ -269,4 +345,228 @@ def get_machine_water_consumption(
         date=date,
         totals=totals,
         intervals=intervals,
+    )
+
+
+def _build_water_report(
+    db: Session, company_id: int, machine_id: int,
+    granularity: str, start: str, end: str,
+):
+    """Shared computation for the JSON report endpoint and its PDF export.
+    Returns (machine_name, boundaries, periods) or raises HTTPException.
+    """
+    if granularity not in VALID_REPORT_GRANULARITIES:
+        raise HTTPException(
+            400,
+            f"Invalid granularity '{granularity}'. Use one of: {sorted(VALID_REPORT_GRANULARITIES)}.",
+        )
+
+    machine = _get_machine(db, company_id, machine_id)
+    if machine is None:
+        raise HTTPException(404, f"Machine {machine_id} not found.")
+
+    flowmeter = _get_flowmeter(db, company_id, machine_id)
+    if flowmeter is None:
+        raise HTTPException(404, f"Machine {machine_id} has no flowmeter component.")
+
+    try:
+        start_date = date_type.fromisoformat(start)
+        end_date   = date_type.fromisoformat(end)
+    except ValueError:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD.")
+    if end_date < start_date:
+        raise HTTPException(400, "'end' must be >= 'start'.")
+
+    boundaries = list(_period_boundaries(granularity, start_date, end_date))
+    if not boundaries:
+        raise HTTPException(400, "No periods in the requested range.")
+    if len(boundaries) > MAX_REPORT_PERIODS:
+        raise HTTPException(
+            400,
+            f"Requested range produces {len(boundaries)} {granularity} periods, "
+            f"exceeding the {MAX_REPORT_PERIODS}-period limit. Narrow the date range "
+            f"or use a coarser granularity.",
+        )
+
+    overall_start = boundaries[0][0]
+    overall_end   = boundaries[-1][1]
+    now_utc = datetime.utcnow()
+
+    series = _load_reading_series(
+        db, flowmeter["component_instance_id"], flowmeter["tag_definition_id"],
+        overall_start, overall_end,
+    )
+
+    periods = []
+    for p_start, p_end in boundaries:
+        w = _window_total(series, p_start, p_end, now_utc)
+        periods.append(WaterReportPeriod(
+            period_start=p_start, period_end=p_end, liters=w.liters, status=w.status,
+        ))
+
+    return machine["name"], periods
+
+
+@router.get("/{machine_id}/water/report", response_model=WaterReportResponse)
+def get_machine_water_report(
+    machine_id: int,
+    granularity: str = Query(..., description="daily | weekly | monthly | yearly"),
+    start: str = Query(..., description="Range start date YYYY-MM-DD"),
+    end: str = Query(..., description="Range end date YYYY-MM-DD (inclusive)"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
+):
+    """
+    Water consumption aggregated into daily/weekly/monthly/yearly periods
+    over [start, end]. Reuses the exact same per-period computation as
+    /water/consumption (_window_total, loaded once via a single
+    _load_reading_series() call spanning the whole range rather than one
+    query per period) — see module docstring and _period_boundaries()'s
+    docstring for the boundary convention and status semantics.
+
+    Unlike /water/consumption's since_9am, an in-progress period here is
+    always "future", never a live/partial number — a report implies
+    completed periods, and showing a partial "this month so far" total
+    risks being misread as final.
+
+    Early periods predating a since-fixed gateway bug (e.g. Jet 11 before
+    2026-09-04's unit-mismatch fix) may correctly show "anomaly" — this is
+    expected, not a bug in this endpoint: see gateway/gateway_service.py's
+    _EUREKA_EU1000_RTU_SPEC comment and the Jet 11 backfill script.
+    """
+    company_id = current_user["company_id"]
+    machine_name, periods = _build_water_report(db, company_id, machine_id, granularity, start, end)
+
+    return WaterReportResponse(
+        machine_id=machine_id,
+        machine_name=machine_name,
+        granularity=granularity,
+        start=start,
+        end=end,
+        periods=periods,
+    )
+
+
+@router.get("/{machine_id}/water/report/pdf")
+def get_machine_water_report_pdf(
+    machine_id: int,
+    granularity: str = Query(..., description="daily | weekly | monthly | yearly"),
+    start: str = Query(..., description="Range start date YYYY-MM-DD"),
+    end: str = Query(..., description="Range end date YYYY-MM-DD (inclusive)"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
+):
+    """
+    Same data as /water/report, rendered as a downloadable PDF — same
+    reportlab structure as telemetry_read.py::get_machine_sensor_log_pdf and
+    machine_state.py::get_machine_state_log_pdf (title/subtitle, summary
+    table, striped period table).
+    """
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+
+    company_id = current_user["company_id"]
+    machine_name, periods = _build_water_report(db, company_id, machine_id, granularity, start, end)
+
+    if not periods:
+        raise HTTPException(404, "No periods in the requested range.")
+
+    ok_periods = [p for p in periods if p.status == "ok"]
+
+    # --- Build PDF in memory ---
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=letter,
+        topMargin=0.6*inch, bottomMargin=0.6*inch,
+        leftMargin=0.7*inch, rightMargin=0.7*inch,
+    )
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        'MevionTitle', parent=styles['Title'],
+        textColor=colors.HexColor('#dc2626'), fontSize=18,
+    )
+    subtitle_style = ParagraphStyle(
+        'MevionSubtitle', parent=styles['Normal'],
+        textColor=colors.HexColor('#6b7280'), fontSize=10,
+    )
+
+    story = []
+    story.append(Paragraph(f"Mevion — Water Consumption Report ({granularity.capitalize()})", title_style))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(
+        f"{machine_name} · {start} to {end}",
+        subtitle_style
+    ))
+    story.append(Spacer(1, 16))
+
+    # Summary stats — total liters and period counts by status
+    total_liters = sum(p.liters for p in ok_periods)
+    summary_data = [
+        ["Periods", "Complete (ok)", "Total Liters", "Flagged (anomaly/no data)"],
+        [
+            str(len(periods)),
+            str(len(ok_periods)),
+            f"{total_liters:,.1f} L",
+            str(len([p for p in periods if p.status in ("anomaly", "no_data")])),
+        ],
+    ]
+    summary_table = Table(summary_data, colWidths=[1.3*inch, 1.5*inch, 1.6*inch, 2.1*inch])
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#f3f4f6')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.HexColor('#374151')),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTNAME', (0,1), (-1,1), 'Helvetica'),
+        ('FONTSIZE', (0,0), (-1,-1), 10),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#e5e7eb')),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+    ]))
+    story.append(summary_table)
+    story.append(Spacer(1, 20))
+
+    # Main period table
+    status_labels = {
+        "ok": "",
+        "future": "Not yet complete",
+        "no_data": "No data",
+        "anomaly": "Anomaly",
+    }
+    table_data = [["Period Start", "Period End", "Liters", "Status"]]
+    for p in periods:
+        liters_str = f"{p.liters:,.1f}" if p.status == "ok" else "—"
+        table_data.append([
+            p.period_start.strftime("%d %b %Y"),
+            p.period_end.strftime("%d %b %Y"),
+            liters_str,
+            status_labels.get(p.status, p.status),
+        ])
+
+    period_table = Table(table_data, colWidths=[1.6*inch, 1.6*inch, 1.3*inch, 2*inch])
+    period_table.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#dc2626')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,-1), 9),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#e5e7eb')),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#f9fafb')]),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+    ]))
+    story.append(period_table)
+
+    doc.build(story)
+    buffer.seek(0)
+
+    machine_slug = machine_name.lower().replace(" ", "-")
+    filename = f"mevion-{machine_slug}-water-report-{granularity}-{start}-{end}.pdf"
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
