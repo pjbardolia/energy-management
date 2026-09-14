@@ -58,7 +58,7 @@ BUCKET_MINUTES    = 30
 
 FLOW_TOTALIZER_TAG_KEY = "flow_totalizer"
 
-VALID_REPORT_GRANULARITIES = {"daily", "weekly", "monthly", "yearly"}
+VALID_REPORT_GRANULARITIES = {"daily", "weekly", "monthly", "yearly", "shift"}
 MAX_REPORT_PERIODS = 500  # same defensive-cap spirit as energy.py's 366-day range check
 
 
@@ -196,6 +196,10 @@ def _period_boundaries(granularity: str, start_date: date_type, end_date: date_t
             NEW CONVENTION, same caveat.
         "yearly"  — calendar year, Jan 1 to Jan 1. NEW CONVENTION, same
             caveat.
+        "shift"   — two 12h periods per day, reusing _op_day_bounds_utc()
+            directly (the exact same function backing shift_a/shift_b in
+            /water/consumption) rather than new boundary math: Shift A
+            09:00-21:00 IST, Shift B 21:00-09:00 IST next day.
     """
     if granularity == "daily":
         d = start_date
@@ -222,6 +226,14 @@ def _period_boundaries(granularity: str, start_date: date_type, end_date: date_t
         while date_type(y, 1, 1) <= end_date:
             yield _ist_9am_utc(date_type(y, 1, 1)), _ist_9am_utc(date_type(y + 1, 1, 1))
             y += 1
+
+    elif granularity == "shift":
+        d = start_date
+        while d <= end_date:
+            day_start, shift_split, day_end = _op_day_bounds_utc(d)
+            yield day_start, shift_split   # Shift A: 09:00-21:00 IST
+            yield shift_split, day_end     # Shift B: 21:00-09:00 IST next day
+            d += timedelta(days=1)
 
     else:
         raise ValueError(f"Unknown granularity: {granularity}")
@@ -410,7 +422,7 @@ def _build_water_report(
 @router.get("/{machine_id}/water/report", response_model=WaterReportResponse)
 def get_machine_water_report(
     machine_id: int,
-    granularity: str = Query(..., description="daily | weekly | monthly | yearly"),
+    granularity: str = Query(..., description="daily | weekly | monthly | yearly | shift"),
     start: str = Query(..., description="Range start date YYYY-MM-DD"),
     end: str = Query(..., description="Range end date YYYY-MM-DD (inclusive)"),
     current_user: dict = Depends(get_current_user),
@@ -450,7 +462,7 @@ def get_machine_water_report(
 @router.get("/{machine_id}/water/report/pdf")
 def get_machine_water_report_pdf(
     machine_id: int,
-    granularity: str = Query(..., description="daily | weekly | monthly | yearly"),
+    granularity: str = Query(..., description="daily | weekly | monthly | yearly | shift"),
     start: str = Query(..., description="Range start date YYYY-MM-DD"),
     end: str = Query(..., description="Range end date YYYY-MM-DD (inclusive)"),
     current_user: dict = Depends(get_current_user),
@@ -536,12 +548,18 @@ def get_machine_water_report_pdf(
         "no_data": "No data",
         "anomaly": "Anomaly",
     }
+    # Shift periods need a time-of-day in the table — two periods can land
+    # on the same calendar date (Shift A/B), which "%d %b %Y" alone can't
+    # tell apart. IST_OFFSET is added before formatting so the displayed
+    # time reads 09:00/21:00 (IST), not the raw naive-UTC 03:30/15:30
+    # stored in period_start/period_end.
+    date_fmt = "%d %b %Y %H:%M" if granularity == "shift" else "%d %b %Y"
     table_data = [["Period Start", "Period End", "Liters", "Status"]]
     for p in periods:
         liters_str = f"{p.liters:,.1f}" if p.status == "ok" else "—"
         table_data.append([
-            p.period_start.strftime("%d %b %Y"),
-            p.period_end.strftime("%d %b %Y"),
+            (p.period_start + IST_OFFSET).strftime(date_fmt),
+            (p.period_end + IST_OFFSET).strftime(date_fmt),
             liters_str,
             status_labels.get(p.status, p.status),
         ])

@@ -2254,6 +2254,19 @@ function fmtPeriodLabel(value, granularity) {
   if (granularity === 'monthly') {
     return d.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata', month: 'short', year: 'numeric' });
   }
+  if (granularity === 'shift') {
+    // Which shift a period is is derived purely from period_start's IST
+    // hour (9 -> Shift A, 21 -> Shift B) — the backend response shape is
+    // unchanged for this granularity, same as every other one.
+    const istHour = parseInt(
+      d.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', hour12: false }),
+      10
+    );
+    const dateLabel = d.toLocaleDateString('en-US', { timeZone: 'Asia/Kolkata', month: 'short', day: 'numeric' });
+    return istHour === 9
+      ? `${dateLabel} Shift A (09:00-21:00)`
+      : `${dateLabel} Shift B (21:00-09:00)`;
+  }
   return d.toLocaleDateString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' });
 }
 
@@ -2334,7 +2347,7 @@ function WaterReportView({ token, eligibleMachines }) {
         </div>
 
         <div style={{ display: 'flex', gap: 4 }}>
-          {[['daily', 'Day'], ['weekly', 'Week'], ['monthly', 'Month'], ['yearly', 'Year']].map(([val, label]) => (
+          {[['daily', 'Day'], ['shift', 'Shift'], ['weekly', 'Week'], ['monthly', 'Month'], ['yearly', 'Year']].map(([val, label]) => (
             <button key={val} onClick={() => setGranularity(val)} style={{
               padding: '5px 14px', borderRadius: 6, fontSize: 13,
               background: granularity === val ? C.red : 'transparent',
