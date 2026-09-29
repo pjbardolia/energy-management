@@ -5,18 +5,25 @@ Runs a background APScheduler job every 60 seconds checking:
 1. Gateway offline (>20 minutes without heartbeat) — alert once, recover once
 2. Motor overcurrent (current > OVERCURRENT_THRESHOLD_A) — alert once per
    machine, recover once per machine when current drops back below threshold
-3. Machine stop/start — alert once per machine when it stops, recover once
-   when it starts running again, with the stopped duration
+3. Machine stop/start — DISABLED 2026-09-29 (too much alert volume to be
+   useful — see check_machine_state_alerts()'s docstring). Function and its
+   _machine_run_state cache are kept for possible future reuse; only the
+   scheduler registration is removed, so the Machine ON/OFF Telegram group
+   simply goes quiet — nothing else changes.
+4. Pressure threshold (pressure > PRESSURE_ALERT_THRESHOLD on any Pressure
+   Transmitter component) — alert once when a channel crosses above
+   threshold, recover once when it drops back through a hysteresis band.
 
 Alert state is kept in memory — resets on server restart, which is acceptable
 since the scheduler will re-detect any active conditions within 60 seconds.
 
-Machine stop/start alerts do NOT recompute running/stopped from raw telemetry
-— they read the same machine_state_event table that already powers the
-Uptime tab's Gantt Timeline, Heatmap Calendar, and Machine Log (written by
-services/state_tracker.py's frequency>0 threshold check, its own separate
-60s job). Reading the same stored fact the dashboard reads guarantees this
-alert can never disagree with what the dashboard shows for the same moment.
+Machine stop/start alerts (disabled, kept for reference) do NOT recompute
+running/stopped from raw telemetry — they read the same machine_state_event
+table that already powers the Uptime tab's Gantt Timeline, Heatmap Calendar,
+and Machine Log (written by services/state_tracker.py's frequency>0
+threshold check, its own separate 60s job). Reading the same stored fact the
+dashboard reads guarantees this alert can never disagree with what the
+dashboard shows for the same moment.
 """
 
 import logging
@@ -37,14 +44,37 @@ GATEWAY_OFFLINE_THRESHOLD_MINUTES = 20
 OVERCURRENT_THRESHOLD_A           = 13.0  # Amperes — alert when any machine exceeds this
 COMPANY_ID                        = 1     # SSPPL — extend to multi-tenant later
 
+# Pressure threshold — hysteresis band, not a single cutoff, so a reading
+# bouncing right at the line doesn't cause repeated alert/clear spam.
+# Values confirmed against 3 days of real production data (2026-09-29)
+# across all 7 pressure channels (component_instance_id 30, 32, 33, 35, 36,
+# 37, 38): only component 37 (Jet 22) crossed 2.5 at all (max 2.774), and a
+# 0.1 kg/cm2 gap collapsed what would have been 5 separate alert/clear
+# cycles (no hysteresis) into effectively one sustained event. All other 6
+# channels stayed under 2.5 throughout (max 2.468) — confirmed this alert
+# will be genuinely quiet under normal operation, not a second spam problem.
+# Uniform across all channels — no evidence in that data that any channel
+# needs a different band.
+PRESSURE_ALERT_THRESHOLD = 2.5   # kg/cm2 — alert when a reading exceeds this
+PRESSURE_CLEAR_THRESHOLD = 2.4   # kg/cm2 — recover only once back at/below this
+
 # Separate Telegram destination for machine stop/start alerts ("Machine
 # ON/OFF" group) — same bot token as everything else (services/telegram.py),
 # just a different chat_id. Deliberately does NOT fall back to the default
 # TELEGRAM_CHAT_ID if unset — see check_machine_state_alerts(), which checks
 # this is truthy before calling send_alert at all, so a misconfiguration
 # shows up as a clear skipped-send warning rather than silently mixing
-# machine state alerts into the overcurrent chat.
+# machine state alerts into the overcurrent chat. (This alert type is
+# disabled — see start_alert_scheduler() — but the constant and its
+# no-fallback pattern are kept since check_machine_state_alerts() itself
+# is kept for possible future reuse.)
 MACHINE_STATE_CHAT_ID = os.environ.get("TELEGRAM_MACHINE_STATE_CHAT_ID", "")
+
+# Separate Telegram destination for pressure threshold alerts — same
+# no-silent-fallback pattern as MACHINE_STATE_CHAT_ID, for the same reason:
+# a misconfiguration should show up as a clear skipped-send warning, not
+# silently mix pressure alerts into the overcurrent chat.
+PRESSURE_CHAT_ID = os.environ.get("TELEGRAM_PRESSURE_CHAT_ID", "")
 
 # --- In-memory alert state ---
 # Prevents sending duplicate alerts every 60 seconds.
@@ -55,8 +85,15 @@ _overcurrent_machines: dict[str, bool] = {}  # machine_name -> True if alert act
 # machine_id -> (last_known_state, started_at of that state's interval).
 # Tuple (not a plain bool like _overcurrent_machines) because the recovery
 # message needs to know when the stopped interval began, to report how long
-# the machine was down.
+# the machine was down. Kept even though the alert using it is disabled —
+# see check_machine_state_alerts().
 _machine_run_state: dict[int, tuple[str, datetime]] = {}
+
+# component_id -> True if a pressure alert is currently active for that
+# component. Keyed by component_id (not machine_name like
+# _overcurrent_machines) since a machine could in principle carry more than
+# one pressure sensor, and component_id is already available from the query.
+_pressure_alert_state: dict[int, bool] = {}
 
 
 def check_gateway_offline() -> None:
@@ -196,6 +233,11 @@ def check_overcurrent() -> None:
 
 def check_machine_state_alerts() -> None:
     """
+    DISABLED 2026-09-29 — see start_alert_scheduler(), where the scheduler
+    registration for this job has been removed (generating too much alert
+    volume to be useful). Kept here, unregistered, for possible future
+    reuse — not deleted, not called anywhere right now.
+
     Alert on machine stop/start transitions.
 
     Reads ONLY the currently-open interval per machine from
@@ -301,6 +343,104 @@ def check_machine_state_alerts() -> None:
         db.close()
 
 
+def check_pressure_alerts() -> None:
+    """
+    Alert when any pressure transmitter's reading exceeds
+    PRESSURE_ALERT_THRESHOLD; recover when it drops back to/below
+    PRESSURE_CLEAR_THRESHOLD.
+
+    Scope is resolved dynamically via component_type_id=3 ("Pressure
+    Transmitter") — not a hardcoded jet list — so this automatically covers
+    every pressure-monitored machine today (Jet 27/25/26/24/23/22/21) and
+    any added later. Same "last(value_num, timestamp) over a bounded recent
+    window" query shape as check_overcurrent(), generalized from
+    tag_definition_id=3 (current) to tag_definition_id=9 (pressure) and from
+    a hardcoded VFD current tag to a component_type_id join.
+
+    Hysteresis (PRESSURE_ALERT_THRESHOLD=2.5, PRESSURE_CLEAR_THRESHOLD=2.4)
+    is a deliberate dead zone, not two independent conditions: a reading
+    between 2.4 and 2.5 while an alert is already active does NOT clear it,
+    and a reading in that same band while normal does NOT trigger it. Only
+    crossing above 2.5 triggers; only crossing at/below 2.4 clears. See the
+    PRESSURE_ALERT_THRESHOLD/PRESSURE_CLEAR_THRESHOLD comment above for the
+    real production data (2026-09-29) this band was confirmed against.
+    """
+    global _pressure_alert_state
+
+    db = SessionLocal()
+    try:
+        sql = text("""
+            SELECT
+                m.name                          AS machine_name,
+                ci.id                            AS component_id,
+                last(td.value_num, td.timestamp) AS latest_pressure,
+                max(td.timestamp)               AS last_updated
+            FROM telemetry_data td
+            JOIN machine_component_instance ci ON ci.id = td.component_instance_id
+            JOIN machine m ON m.id = ci.machine_id
+            WHERE ci.component_type_id = 3
+              AND td.tag_definition_id = 9
+              AND td.company_id = :company_id
+              AND td.timestamp > NOW() - INTERVAL '5 minutes'
+            GROUP BY m.name, ci.id
+            ORDER BY m.name
+        """)
+
+        result = db.execute(sql, {"company_id": COMPANY_ID})
+        rows = result.mappings().fetchall()
+
+        for row in rows:
+            machine_name    = row["machine_name"]
+            component_id    = row["component_id"]
+            latest_pressure = float(row["latest_pressure"]) if row["latest_pressure"] is not None else 0.0
+            was_over        = _pressure_alert_state.get(component_id, False)
+
+            if not was_over and latest_pressure > PRESSURE_ALERT_THRESHOLD:
+                # Just crossed above threshold — send alert
+                msg = (
+                    f"🔴 <b>High Pressure — {machine_name} (SSPPL)</b>\n\n"
+                    f"Pressure: <b>{latest_pressure:.2f} kg/cm²</b> "
+                    f"(threshold: {PRESSURE_ALERT_THRESHOLD:.1f} kg/cm²)\n\n"
+                    f"Check nozzle/pump for a blockage or valve issue."
+                )
+                if PRESSURE_CHAT_ID:
+                    send_alert(msg, chat_id=PRESSURE_CHAT_ID)
+                    log.warning("Pressure alert: %s at %.2f kg/cm2", machine_name, latest_pressure)
+                else:
+                    log.warning(
+                        "Pressure alert chat not configured "
+                        "(TELEGRAM_PRESSURE_CHAT_ID unset) — skipping send: %s", msg,
+                    )
+                _pressure_alert_state[component_id] = True
+
+            elif was_over and latest_pressure <= PRESSURE_CLEAR_THRESHOLD:
+                # Dropped back through the hysteresis band — send recovery
+                msg = (
+                    f"✅ <b>{machine_name} Pressure Normal — SSPPL</b>\n\n"
+                    f"Pressure back to {latest_pressure:.2f} kg/cm² "
+                    f"(was above {PRESSURE_ALERT_THRESHOLD:.1f} kg/cm² threshold)."
+                )
+                if PRESSURE_CHAT_ID:
+                    send_alert(msg, chat_id=PRESSURE_CHAT_ID)
+                    log.info("Pressure recovery: %s at %.2f kg/cm2", machine_name, latest_pressure)
+                else:
+                    log.warning(
+                        "Pressure alert chat not configured "
+                        "(TELEGRAM_PRESSURE_CHAT_ID unset) — skipping send: %s", msg,
+                    )
+                _pressure_alert_state[component_id] = False
+
+            # else: no state change — either still normal, or sitting in the
+            # hysteresis dead zone (2.4, 2.5] while an alert is active. This
+            # is the anti-spam guarantee: one alert per crossing, silence
+            # while the reading hovers near the line.
+
+    except Exception as exc:
+        log.error("Error in check_pressure_alerts: %s", exc)
+    finally:
+        db.close()
+
+
 def start_alert_scheduler() -> BackgroundScheduler:
     """
     Start the APScheduler background scheduler.
@@ -331,18 +471,34 @@ def start_alert_scheduler() -> BackgroundScheduler:
         next_run_time=datetime.now(timezone.utc) + timedelta(seconds=30),
     )
 
-    # Machine stop/start check: every 60 seconds, offset 15 s from the other
-    # two jobs so all three don't hit the DB in the same instant
+    # Machine stop/start check — DISABLED 2026-09-29 (too much alert volume
+    # to be useful). check_machine_state_alerts() and its cache are kept in
+    # the module for possible future reuse; only this registration is
+    # removed, so the job simply never runs and the Machine ON/OFF Telegram
+    # group goes quiet. Nothing else in the scheduler is affected.
+    #
+    # scheduler.add_job(
+    #     check_machine_state_alerts,
+    #     trigger="interval",
+    #     seconds=60,
+    #     id="machine_state_alert_check",
+    #     name="Machine stop/start alert checker",
+    #     misfire_grace_time=30,
+    #     next_run_time=datetime.now(timezone.utc) + timedelta(seconds=15),
+    # )
+
+    # Pressure threshold check: every 60 seconds, offset 45 s from the other
+    # jobs so none of them hit the DB in the same instant
     scheduler.add_job(
-        check_machine_state_alerts,
+        check_pressure_alerts,
         trigger="interval",
         seconds=60,
-        id="machine_state_alert_check",
-        name="Machine stop/start alert checker",
+        id="pressure_alert_check",
+        name="Pressure threshold alert checker",
         misfire_grace_time=30,
-        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=15),
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=45),
     )
 
     scheduler.start()
-    log.info("Alert scheduler started — gateway, overcurrent, and machine state checks every 60s")
+    log.info("Alert scheduler started — gateway, overcurrent, and pressure threshold checks every 60s")
     return scheduler
