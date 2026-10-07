@@ -712,7 +712,10 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
       </header>
 
       <main style={{padding:"20px 24px", maxWidth:1440, margin:"0 auto"}}>
-        {/* KPI bar — values from /fleet/summary; total shows server count / master count */}
+        {/* KPI bar — values from /fleet/summary; total shows server count / master count.
+            Hidden on the Temperature & Pressure board, which has its own summary strip
+            and needs the vertical space to fit 1080p without scrolling. */}
+        {activePage !== 'temperature' && (
         <div className="ks" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:20}}>
           {[
             {label:"Total machines", val:`${summary.total_machines} / ${MACHINES.length}`, unit:"",   color:C.text   },
@@ -732,6 +735,7 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
             </div>
           ))}
         </div>
+        )}
 
         {/* Gateway offline banner — driven by heartbeat, not individual machine staleness.
             A single machine with a Modbus timeout shows STALE on its tile; the fleet
@@ -803,7 +807,8 @@ const FleetDashboard = ({token, onLogout, onSelect}) => {
 
         {/* Temperature & Pressure tab */}
         {activePage === 'temperature' && (
-          <TemperatureAndPressurePage token={token} onLogout={onLogout} />
+          <TemperatureAndPressurePage token={token} onLogout={onLogout}
+            fleet={fleet} fleetLoading={loading} fleetError={error} />
         )}
 
         {/* Uptime tab — Gantt timeline, heatmap calendar, OEE availability cards */}
@@ -1711,12 +1716,12 @@ function SensorReadingCard({ machineName, sensorLabel, value, unit, decimals, is
   );
 }
 
-function TemperatureAndPressurePage({ token, onLogout }) {
+function TemperatureAndPressureDetail({ token, onLogout, initialMachineId = null, onBack = null }) {
   // Fleet-wide live tags — same endpoint /machines/live already uses to
   // group readings by machine_id. Eligible machines (selector options) and
   // the selected machine's live values are both derived from this one poll.
   const [liveByMachine, setLiveByMachine] = useState([]);
-  const [selectedMachineId, setSelectedMachineId] = useState(null);
+  const [selectedMachineId, setSelectedMachineId] = useState(initialMachineId);
 
   const [hours, setHours]           = useState(1);
   const [histData, setHistData]     = useState(null);
@@ -1751,8 +1756,11 @@ function TemperatureAndPressurePage({ token, onLogout }) {
   }, [token]);
 
   // Machines with at least one of (temperature, pressure) — no hardcoded IDs.
+  // The machine opened from the board stays selectable even if its sensor is
+  // currently silent (outside /machines/live's 10-minute window).
   const eligibleMachines = liveByMachine.filter(
     m => m.tags?.temperature != null || m.tags?.pressure != null
+      || (initialMachineId != null && m.machine_id === initialMachineId)
   );
 
   // Default/keep selection valid as the eligible list changes.
@@ -1845,6 +1853,12 @@ function TemperatureAndPressurePage({ token, onLogout }) {
   return (
     <div style={{ padding: '24px 32px', maxWidth: 1200, margin: '0 auto' }}>
 
+      {onBack && (
+        <button onClick={onBack} style={{
+          padding: '6px 14px', borderRadius: 6, fontSize: 13, marginBottom: 12,
+          background: 'transparent', color: '#6b7280', border: '1px solid #e5e7eb', cursor: 'pointer',
+        }}>← Back to board</button>
+      )}
       <h2 style={{ fontSize: 20, fontWeight: 700, marginBottom: 16, color: '#1f2937' }}>
         Temperature & Pressure Monitor
       </h2>
@@ -2077,6 +2091,333 @@ function TemperatureAndPressurePage({ token, onLogout }) {
             </div>
           )}
         </>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   TEMPERATURE & PRESSURE BOARD — tile grid for the office screen
+   (1080p, read from 2-3 m). One tile per machine that has a pressure
+   and/or temperature sensor.
+
+   Data: fresh values + running/idle state come from Fleet's own
+   /machines/live poll (passed in as `fleet`, so this tab can never disagree
+   with the Fleet tiles); membership, last-seen fallback, 1 h sparkline,
+   shift peak and the hysteresis alarm state come from GET /pressure/board.
+   The previous page (gauges, trend charts, log table, PDF) is kept as
+   TemperatureAndPressureDetail and opens when a tile is clicked.
+═══════════════════════════════════════════════════════════════ */
+
+// Fallback only, used if /pressure/board is unreachable. The board response
+// carries the real thresholds (single source: services/alert_scheduler.py).
+const PRESSURE_FALLBACK_ALERT = 2.5;
+const PRESSURE_FALLBACK_CLEAR = 2.4;
+const SPARK_GAP_MS = 3 * 60_000;   // break the line across outages instead of interpolating
+
+const parseUtcMs = (s) => new Date(s.endsWith('Z') ? s : s + 'Z').getTime();
+const timeIST24 = (ms) =>
+  new Date(ms).toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour12: false });
+
+function PressureSparkline({ points, limit, color }) {
+  const nowMs = Date.now();
+  const startMs = nowMs - 60 * 60_000;
+  const pts = (points || []).map(p => ({ x: parseUtcMs(p.t), v: p.v })).filter(p => p.x >= startMs);
+  if (pts.length < 2) {
+    return <div style={{ fontSize: 11, color: '#9ca3af', alignSelf: 'center' }}>no 1 h history</div>;
+  }
+  const ymax = Math.max(limit * 1.2, Math.max(...pts.map(p => p.v)) * 1.1);
+  const X = x => ((x - startMs) / (nowMs - startMs)) * 100;
+  const Y = v => 40 - (v / ymax) * 40;
+  const segs = [];
+  let cur = [];
+  pts.forEach((p, i) => {
+    if (i > 0 && p.x - pts[i - 1].x > SPARK_GAP_MS) { segs.push(cur); cur = []; }
+    cur.push(p);
+  });
+  segs.push(cur);
+  return (
+    <svg viewBox="0 0 100 40" preserveAspectRatio="none" style={{ width: '100%', height: '100%', display: 'block' }}>
+      <line x1="0" x2="100" y1={Y(limit)} y2={Y(limit)} stroke="#f87171" strokeWidth="1"
+        strokeDasharray="3 3" vectorEffect="non-scaling-stroke" />
+      {segs.map((seg, i) => (
+        <polyline key={i} fill="none" stroke={color} strokeWidth="2" strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+          points={(seg.length === 1 ? [seg[0], { x: seg[0].x + 40_000, v: seg[0].v }] : seg)
+            .map(p => `${X(p.x).toFixed(2)},${Y(p.v).toFixed(2)}`).join(' ')} />
+      ))}
+    </svg>
+  );
+}
+
+// Merge one /pressure/board machine with its Fleet live row into display state.
+function buildPressureTile(bm, live, limit, clear) {
+  const liveTags = live?.last_updated ? (live.tags || {}) : {};
+  const hasPressure = !!bm.pressure;
+  const hasTemp = !!bm.temperature;
+
+  const pVal = hasPressure ? (liveTags.pressure ?? bm.pressure.value) : null;
+  const pTs  = hasPressure ? bm.pressure.timestamp : null;
+  const pStale = hasPressure && (pVal == null || !pTs || isStale(pTs));
+
+  const tVal = hasTemp ? (liveTags.temperature ?? bm.temperature.value) : null;
+  const tTs  = hasTemp ? bm.temperature.timestamp : null;
+  const tStale = hasTemp && (tVal == null || !tTs || isStale(tTs));
+
+  const state = live ? getMachineState(live) : 'NO_DATA';
+
+  // Hysteresis, same rule as check_pressure_alerts(): > limit alarms,
+  // <= clear releases, anything in between keeps the previous state. The
+  // previous state is the server's replay; the fresh live value moves it.
+  let alarm = !!bm.alarm_active;
+  if (!pStale && pVal != null) {
+    if (pVal > limit) alarm = true;
+    else if (pVal <= clear) alarm = false;
+  }
+  if (pStale) alarm = false;   // an old reading must not hold an alarm
+
+  let kind;
+  if (hasPressure) {
+    if (pVal == null && !pTs) kind = 'nodata';
+    else if (pStale)          kind = 'stale';
+    else if (alarm)           kind = 'alarm';
+    else if (state === 'STOPPED') kind = 'idle';
+    else                      kind = 'normal';
+  } else {
+    kind = tStale ? 'stale' : (state === 'STOPPED' ? 'idle' : 'normal');
+  }
+
+  const alarmMin = alarm && bm.above_since
+    ? Math.max(0, Math.floor((Date.now() - parseUtcMs(bm.above_since)) / 60_000)) : 0;
+
+  return {
+    id: bm.machine_id, name: bm.machine_name, model: live?.model || '',
+    hasPressure, hasTemp, pVal, pTs, pStale, tVal, tTs, tStale,
+    kind, alarm, alarmMin, alarmTruncated: !!bm.above_since_truncated,
+    // A running machine reading exactly 0.0 usually means the 4-20 mA loop is
+    // open (read_ai8ch_pressure clamps < 4 mA to 0.0), not "no pressure".
+    zeroWarn: state === 'RUNNING' && pVal === 0 && !pStale,
+    peak: bm.shift_peak, spark: bm.sparkline || [],
+    rank: kind === 'alarm' ? 0 : kind === 'normal' ? 1 : 2,
+  };
+}
+
+const PRESSURE_TILE_STYLE = {
+  alarm:  { border: C.red,     bg: '#FFF1F2', value: C.red },
+  normal: { border: C.running, bg: C.white,   value: C.text },
+  idle:   { border: C.stopped, bg: '#FAFAFA', value: '#9ca3af' },
+  stale:  { border: C.stopped, bg: '#FAFAFA', value: '#9ca3af' },
+  nodata: { border: C.stopped, bg: '#FAFAFA', value: '#9ca3af' },
+};
+
+function PressureTile({ tile, limit, onClick }) {
+  const st = PRESSURE_TILE_STYLE[tile.kind];
+  const badge = tile.kind === 'alarm'
+    ? { text: 'ABOVE LIMIT', bg: C.red, fg: '#fff' }
+    : tile.kind === 'idle'  ? { text: 'Idle', bg: '#E5E7EB', fg: '#6b7280' }
+    : tile.kind === 'stale' ? { text: `Last seen ${lastSeenText(tile.pTs || tile.tTs)}`, bg: '#E5E7EB', fg: '#6b7280' }
+    : tile.kind === 'nodata' ? { text: 'No data', bg: '#E5E7EB', fg: '#6b7280' }
+    : null;
+  return (
+    <div onClick={onClick} title="Click for trend, log and PDF" style={{
+      background: st.bg, border: `1px solid ${C.border}`, borderLeft: `6px solid ${st.border}`,
+      borderRadius: 10, padding: '10px 14px', cursor: 'pointer', overflow: 'hidden',
+      display: 'flex', flexDirection: 'column', minHeight: 0,
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 26, fontWeight: 800, color: C.text, lineHeight: 1.1 }}>{tile.name}</div>
+          <div style={{ fontSize: 13, color: C.muted }}>{tile.model}</div>
+        </div>
+        {badge && (
+          <span style={{
+            background: badge.bg, color: badge.fg, borderRadius: 6, padding: '3px 8px',
+            fontSize: 14, fontWeight: 700, whiteSpace: 'nowrap',
+          }}>{badge.text}</span>
+        )}
+      </div>
+
+      <div style={{ display: 'flex', gap: 12, flex: 1, minHeight: 0, alignItems: 'stretch', marginTop: 4 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', flexShrink: 0 }}>
+          {tile.hasPressure && (
+            <div style={{ fontSize: 64, fontWeight: 800, lineHeight: 1, color: st.value,
+              fontVariantNumeric: 'tabular-nums', letterSpacing: -1 }}>
+              {tile.pVal != null ? tile.pVal.toFixed(2) : '—'}
+              <span style={{ fontSize: 15, fontWeight: 500, color: C.muted, marginLeft: 4, letterSpacing: 0 }}>kg/cm²</span>
+            </div>
+          )}
+          {tile.kind === 'alarm' && (
+            <div style={{ fontSize: 17, fontWeight: 700, color: C.red, marginTop: 2 }}>
+              above limit for {tile.alarmTruncated ? '≥ ' : ''}{tile.alarmMin} min
+            </div>
+          )}
+          {tile.zeroWarn && (
+            <div title="Reads exactly 0.0 kg/cm² while the machine is running — the 4-20 mA loop may be open or the sensor failed" style={{ fontSize: 14, fontWeight: 700, color: '#92400E', background: '#FEF3C7',
+              borderRadius: 5, padding: '2px 6px', marginTop: 3, alignSelf: 'flex-start' }}>
+              ⚠ 0.0 while running
+            </div>
+          )}
+          {tile.hasTemp && (
+            <div style={{ fontSize: 26, fontWeight: 700, marginTop: 4,
+              color: tile.tStale ? '#9ca3af' : C.text, fontVariantNumeric: 'tabular-nums' }}>
+              {tile.tStale
+                ? <span style={{ fontSize: 14, fontWeight: 600 }}>Temp: last seen {lastSeenText(tile.tTs)}</span>
+                : <>{tile.tVal.toFixed(1)}<span style={{ fontSize: 13, fontWeight: 500, color: C.muted, marginLeft: 3 }}>°C</span></>}
+            </div>
+          )}
+        </div>
+
+        {tile.hasPressure && (
+          <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
+            <div style={{ flex: 1, minHeight: 28, maxHeight: 70 }}>
+              <PressureSparkline points={tile.spark} limit={limit}
+                color={tile.kind === 'alarm' ? C.red : tile.kind === 'normal' ? C.running : '#9ca3af'} />
+            </div>
+            <div style={{ fontSize: 13, color: C.muted, marginTop: 3, textAlign: 'right' }}>
+              1 h · peak this shift{' '}
+              <b style={{ color: tile.peak != null && tile.peak > limit ? C.red : C.text }}>
+                {tile.peak != null ? tile.peak.toFixed(2) : '—'}
+              </b>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TemperatureAndPressurePage({ token, onLogout, fleet = [], fleetLoading = false, fleetError = null }) {
+  const [board, setBoard]           = useState(null);
+  const [boardError, setBoardError] = useState(null);
+  const [boardAt, setBoardAt]       = useState(null);
+  const [fleetAt, setFleetAt]       = useState(null);
+  const [detailId, setDetailId]     = useState(null);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    const load = () => {
+      apiFetch('/pressure/board', token)
+        .then(data => { if (!cancelled) { setBoard(data); setBoardError(null); setBoardAt(Date.now()); } })
+        .catch(e => {
+          if (cancelled) return;
+          if (e.status === 401) { onLogout(); return; }
+          setBoardError(e.message || 'Board data unavailable');   // keep last good board
+        });
+    };
+    load();
+    const id = setInterval(load, POLL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [token, onLogout]);
+
+  useEffect(() => { setFleetAt(Date.now()); }, [fleet]);
+
+  if (detailId != null) {
+    return <TemperatureAndPressureDetail token={token} onLogout={onLogout}
+      initialMachineId={detailId} onBack={() => setDetailId(null)} />;
+  }
+
+  const limit = board?.alert_threshold ?? PRESSURE_FALLBACK_ALERT;
+  const clear = board?.clear_threshold ?? PRESSURE_FALLBACK_CLEAR;
+  const liveById = Object.fromEntries((fleet || []).map(m => [m.machine_id, m]));
+
+  // If the board endpoint is down, still show every machine that Fleet can see
+  // a pressure/temperature tag for (values only, no sparkline/peak).
+  const boardMachines = board
+    ? board.machines
+    : (fleet || []).filter(m => m.tags?.pressure != null || m.tags?.temperature != null).map(m => ({
+        machine_id: m.machine_id, machine_name: m.machine_name,
+        pressure: m.tags.pressure != null ? { value: m.tags.pressure, timestamp: m.last_updated } : null,
+        temperature: m.tags.temperature != null ? { value: m.tags.temperature, timestamp: m.last_updated } : null,
+        alarm_active: false, above_since: null, above_since_truncated: false, shift_peak: null, sparkline: [],
+      }));
+
+  const tiles = boardMachines
+    .map(bm => buildPressureTile(bm, liveById[bm.machine_id], limit, clear))
+    .sort((a, b) => a.rank - b.rank || (b.pVal ?? -1) - (a.pVal ?? -1));
+
+  const sensors   = tiles.filter(t => t.hasPressure);
+  const reporting = sensors.filter(t => !t.pStale && t.pVal != null);
+  const alarmCnt  = tiles.filter(t => t.kind === 'alarm').length;
+  const highest   = reporting.reduce((best, t) => (best == null || t.pVal > best.pVal ? t : best), null);
+  const updatedMs = Math.max(boardAt || 0, fleetAt || 0) || null;
+
+  const rows = Math.max(4, Math.ceil(tiles.length / 4));
+  const statBox = { background: C.white, border: `1px solid ${C.border}`, borderRadius: 10, padding: '8px 16px' };
+  const statLabel = { fontSize: 14, color: C.muted, fontWeight: 600 };
+  const statVal = { fontSize: 30, fontWeight: 800, lineHeight: 1.15, fontVariantNumeric: 'tabular-nums' };
+
+  return (
+    <div className="pb-wrap">
+      <style>{`
+        body{margin:0}   /* only while the board is mounted: index.html has no reset, so the default 8px body margin + the root's min-height:100vh would force a page scrollbar */
+        .pb-wrap{display:flex;flex-direction:column;gap:12px;height:calc(100vh - 116px);min-height:560px}
+        @media(min-width:1480px){.pb-wrap{width:calc(100vw - 48px);position:relative;left:50%;transform:translateX(-50%)}}
+        .pb-grid{flex:1;min-height:0;display:grid;gap:12px;overflow-y:auto;
+          grid-template-columns:repeat(4,minmax(0,1fr));
+          grid-template-rows:repeat(var(--pb-rows),minmax(190px,1fr))}
+        @media(max-width:960px){
+          .pb-wrap{height:auto}
+          .pb-grid{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:none;grid-auto-rows:minmax(200px,auto)}
+        }
+      `}</style>
+
+      <div style={{ display: 'flex', gap: 12, alignItems: 'stretch', flexWrap: 'wrap' }}>
+        <div style={{ ...statBox, flex: '1 1 160px' }}>
+          <div style={statLabel}>Pressure sensors reporting</div>
+          <div style={{ ...statVal, color: sensors.length && reporting.length < sensors.length ? C.amber : C.text }}>
+            {reporting.length}/{sensors.length}
+          </div>
+        </div>
+        <div style={{ ...statBox, flex: '1 1 160px' }}>
+          <div style={statLabel}>Above {limit.toFixed(1)} kg/cm²</div>
+          <div style={{ ...statVal, color: alarmCnt > 0 ? C.red : C.text }}>{alarmCnt}</div>
+        </div>
+        <div style={{ ...statBox, flex: '2 1 240px' }}>
+          <div style={statLabel}>Highest pressure</div>
+          <div style={statVal}>
+            {highest ? <>{highest.pVal.toFixed(2)}
+              <span style={{ fontSize: 14, fontWeight: 500, color: C.muted }}> kg/cm² · </span>{highest.name}</> : '—'}
+          </div>
+        </div>
+        <div style={{
+          flex: '1 1 200px', borderRadius: 10, padding: '8px 16px', display: 'flex',
+          flexDirection: 'column', justifyContent: 'center',
+          background: alarmCnt > 0 ? '#FFF1F2' : reporting.length ? '#F0FDF4' : '#F3F4F6',
+          border: `1px solid ${alarmCnt > 0 ? '#FECACA' : reporting.length ? '#BBF7D0' : C.border}`,
+        }}>
+          <div style={{ fontSize: 28, fontWeight: 800,
+            color: alarmCnt > 0 ? C.red : reporting.length ? C.running : C.muted }}>
+            {alarmCnt > 0 ? `${alarmCnt} above limit` : reporting.length ? 'All normal' : 'No data'}
+          </div>
+          <div style={{ fontSize: 14, color: C.muted }}>
+            Updated {updatedMs ? timeIST24(updatedMs) : '—'} IST
+            {board ? ` · Shift ${board.shift}` : ''}
+          </div>
+        </div>
+      </div>
+
+      {(boardError || fleetError) && (
+        <div style={{ background: '#FFFBEB', border: '1px solid #FDE68A', borderRadius: 8,
+          padding: '6px 12px', fontSize: 13, color: '#92400E' }}>
+          ⚠ {boardError ? `Trend/peak data unavailable (${boardError}) — showing live values only.` : `Live data: ${fleetError}`}
+        </div>
+      )}
+
+      {tiles.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: 60, color: '#9ca3af' }}>
+          {(!board && !boardError) || (fleetLoading && !board)
+            ? 'Loading pressure board…'
+            : boardError && !board
+              ? `Could not load sensors: ${boardError}`
+              : 'No machines have a pressure or temperature sensor configured.'}
+        </div>
+      ) : (
+        <div className="pb-grid" style={{ '--pb-rows': rows }}>
+          {tiles.map(t => (
+            <PressureTile key={t.id} tile={t} limit={limit} onClick={() => setDetailId(t.id)} />
+          ))}
+        </div>
       )}
     </div>
   );

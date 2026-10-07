@@ -37,6 +37,7 @@ from routers.runtime import router as runtime_router
 from routers.energy import router as energy_router
 from routers.machine_state import router as machine_state_router
 from routers.water import router as water_router
+from routers.pressure_board import router as pressure_board_router
 from services.alert_scheduler import start_alert_scheduler
 from services.state_tracker import start_state_tracker
 
@@ -94,6 +95,7 @@ app.include_router(runtime_router)            # GET /runtime/fleet/current-shift
 app.include_router(energy_router)             # GET /energy/fleet/current-shift, /fleet/range, /machines/{id}/range
 app.include_router(machine_state_router)      # GET /machines/{id}/state-timeline, /machines/state-timeline, /machines/{id}/utilization-daily
 app.include_router(water_router)              # GET /machines/{id}/water/consumption
+app.include_router(pressure_board_router)     # GET /pressure/board
 
 # Password hashing context — bcrypt==4.0.1 is pinned in requirements.txt
 # because newer bcrypt versions break passlib's internal API.
