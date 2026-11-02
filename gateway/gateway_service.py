@@ -14,7 +14,11 @@ hardware specs belong in code, deployment config belongs in config.json):
   - YASKAWA_V1000  : same spec as A1000
   - YASKAWA_F7     : same spec as A1000
   - DELTA_CP2000   : 5 registers at 0x2200 (current/freq/dc_voltage/output_voltage)
-  - ELECTROSIL_FX438 : 1 register at 0x0000 (process temperature)
+  - ELECTROSIL_FX438 : 1 register at 138 (process temperature, whole °C)
+                     — Jet 27's meter
+  - ITHERM_FX438_TENTHS : same register, but the meter sends tenths of a
+                     degree (raw / 10) — the 12 meters on Jets 21-26 and
+                     28-33, added 2026-11-03
   - EUREKA_EU1000  : magnetic flowmeter — 2 registers at 2001 (instantaneous
                      flow, float32) + extra reads at 2007/2009 (totalizer,
                      uint32 + float32, summed into one flow_totalizer value).
@@ -196,14 +200,28 @@ _DELTA_CP2000_SPEC = {
 }
 
 # Electrosil Fx-438 PID temperature controller (dyebath temperature sensor).
-# Register 0x0000 = Process Value (current measured temperature).
-# Source: Electrosil Fx-438 manual + standard PID controller convention.
-# Raw value / 10 = °C  (e.g. 260 → 26.0 °C).
+# Register 138 (0x008A) = Process Value (current measured temperature).
+# Jet 27's meter sends whole degrees: raw value = °C, no scaling (verified
+# against its display 2026-07-19). Meters set to show one decimal send
+# tenths instead - those use _ITHERM_FX438_TENTHS_SPEC below.
 _ELECTROSIL_FX438_SPEC = {
     "address": 138,       # PV register (decimal 138 = 0x008A per official Modbus address doc)
     "count":   1,
     "registers": [
         ("temperature", 0, 1),   # Process value raw → °C (no scaling, verified 2026-07-19)
+    ],
+}
+
+# iTherm FX-438 meters that send TENTHS of a degree (raw 1358 = 135.8 °C):
+# the 12 meters on Jets 21-26 and 28-33 (slaves 4-15 on /dev/ttyUSB0).
+# Same physical model and register as Jet 27's meter above, but their
+# displays show one decimal, so the register carries tenths. Probed
+# read-only 2026-11-02: all 12 answer at register 138 / FC03.
+_ITHERM_FX438_TENTHS_SPEC = {
+    "address": 138,       # PV register, same as _ELECTROSIL_FX438_SPEC
+    "count":   1,
+    "registers": [
+        ("temperature", 0, 10),  # raw / 10 → °C (meter shows one decimal)
     ],
 }
 
@@ -336,6 +354,7 @@ VFD_REGISTER_MAPS = {
     "YASKAWA_F7":       _YASKAWA_SPEC,
     "DELTA_CP2000":     _DELTA_CP2000_SPEC,
     "ELECTROSIL_FX438": _ELECTROSIL_FX438_SPEC,
+    "ITHERM_FX438_TENTHS": _ITHERM_FX438_TENTHS_SPEC,
     "EUREKA_EU1000":    _EUREKA_EU1000_SPEC,
     "EUREKA_EU1000_RTU": _EUREKA_EU1000_RTU_SPEC,
     "ARROWMECH_AEFM100": _ARROWMECH_AEFM100_SPEC,
@@ -1069,6 +1088,17 @@ _EU1000_MAX_PLAUSIBLE_RATE_L_PER_SEC = 33.33
 _last_totalizer_reading: dict[int, tuple[float, float]] = {}
 
 
+# Plausible range per tag, in engineering units after scaling. A value
+# outside its range is a sensor-fault code, not a measurement: read_modbus()
+# drops it (with a WARNING) instead of writing it. On a broken thermocouple
+# or RTD a PID meter typically reports a sentinel such as 32767 or 65535,
+# which would otherwise be stored as 3276.7 °C (tenths) or 65535 °C, poison
+# the charts and need a bulk clean-up later. A dropped reading just leaves
+# the tile stale, which is the honest signal. Dyebaths run ~25-140 °C.
+_PLAUSIBLE_RANGE = {
+    "temperature": (0.0, 200.0),   # °C
+}
+
 def read_modbus(
     client: ModbusSerialClient,
     slave_id: int,
@@ -1280,6 +1310,18 @@ def read_modbus(
                 else:
                     values["flow_totalizer"] = candidate_total
                     _last_totalizer_reading[component_instance_id] = (candidate_total, now)
+
+    # Drop sensor-fault values (see _PLAUSIBLE_RANGE). Only the offending
+    # tag is dropped; any other tags from the same device are kept.
+    for tag_name, (low, high) in _PLAUSIBLE_RANGE.items():
+        value = values.get(tag_name)
+        if value is not None and not (low <= value <= high):
+            log.warning(
+                "Slave %d [%s]: %s %.1f outside the plausible range "
+                "%.0f-%.0f — likely a sensor fault code, skipping it this cycle",
+                slave_id, vfd_model, tag_name, value, low, high,
+            )
+            del values[tag_name]
 
     return values
 
