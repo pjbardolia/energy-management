@@ -1589,7 +1589,9 @@ const AnalyticsPage = ({ token, onLogout }) => {
 // literals. Pressure range matches the Baumer CTX3.2.3.B20.0 transmitters
 // currently deployed (0-6 bar rated, converted to kg/cm² by the gateway's
 // read_ai8ch_pressure(): 6 bar × 1.01972 kg/cm²/bar = 6.118).
-const TEMP_RANGE     = { min: 0, max: 120 };
+// Temperature max 150: the jets run up to ~135 °C (Jet 21 read 135.8 °C on
+// 2026-11-02), which pinned the old 120 °C scale at full.
+const TEMP_RANGE     = { min: 0, max: 150 };
 const PRESSURE_RANGE = { min: 0, max: 6.118 };
 
 // 24-hour IST time label — used for chart x-axes (requirement: no AM/PM,
