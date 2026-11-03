@@ -8,7 +8,12 @@ gateway_service.py (the one that knows ITHERM_FX438_TENTHS) is in place and
 BEFORE restarting the gateway:
 
     cd /home/pi/gateway
-    python3 pi_add_temperature_meters.py
+    python3 pi_add_temperature_meters.py --skip 23     # leave Jet 23 out
+
+--skip takes jet numbers (e.g. --skip 23 or --skip 23 31) for meters that are
+not on the bus: a missing meter costs the gateway up to ~4 s of timeouts on
+every poll cycle. Meters already in config.json are left as they are, so once
+a skipped meter is back, run it again without --skip to add just that one.
 
 What it does, in order:
   1. Refuses unless gateway_service.py in this folder knows ITHERM_FX438_TENTHS.
@@ -16,16 +21,18 @@ What it does, in order:
      starting at all (systemd retries every 10 s, with no data from any bus).
   2. Refuses unless config.json has the /dev/ttyUSB0 bus and
      tag_definition_ids["temperature"] is 8.
-  3. Refuses if any of slaves 4-15 on /dev/ttyUSB0, or any of component ids
-     45-56 on any bus, is already used by something else. If all 12 entries
-     are already there, it says so and changes nothing.
+  3. For each meter to add: skips it if the exact entry is already there;
+     refuses if its slave id (on /dev/ttyUSB0) or its component id (on any
+     bus) is already used by something else.
   4. Copies config.json to config.json.bak-<date_time>, writes the new file,
      then checks it with gateway_service.load_config() — the same check the
      gateway runs at startup. If that check fails, it puts the backup back.
 
-It never restarts the gateway: you do that after it prints OK.
+It never removes entries and never restarts the gateway: you restart after it
+prints OK.
 """
 
+import argparse
 import datetime
 import json
 import os
@@ -44,19 +51,23 @@ METERS = [
     (8, "Jet 25", 49), (9, "Jet 26", 50), (10, "Jet 28", 51), (11, "Jet 29", 52),
     (12, "Jet 30", 53), (13, "Jet 31", 54), (14, "Jet 32", 55), (15, "Jet 33", 56),
 ]
-NEW_DEVICES = [
-    {"name": "{} Temp".format(jet), "slave_id": slave, "vfd_model": MODEL,
-     "component_instance_id": comp}
-    for slave, jet, comp in METERS
-]
-
-
 def fail(message):
     print("NOT CHANGED: " + message)
     sys.exit(1)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Add the FX-438 temperature meters to config.json.")
+    parser.add_argument("--skip", nargs="+", type=int, default=[], metavar="JET",
+                        help="jet numbers whose meter is not on the bus, e.g. --skip 23")
+    args = parser.parse_args()
+    known_jets = {int(jet.split()[1]) for _, jet, _ in METERS}
+    unknown = sorted(set(args.skip) - known_jets)
+    if unknown:
+        fail("--skip {}: not one of the 12 new meters (Jets {}).".format(
+            " ".join(map(str, unknown)), ", ".join(str(j) for j in sorted(known_jets))))
+    wanted = [m for m in METERS if int(m[1].split()[1]) not in args.skip]
+
     for name in ("gateway_service.py", "config.json"):
         if not os.path.exists(os.path.join(GATEWAY_DIR, name)):
             fail("{} not found in {}. Put this script in the gateway folder "
@@ -81,34 +92,38 @@ def main():
     if tag != TEMPERATURE_TAG_ID:
         fail('tag_definition_ids["temperature"] is {!r}, expected {}.'.format(tag, TEMPERATURE_TAG_ID))
 
-    # 3. Already done? Anything in the way?
+    # 3. What's already there, and is anything in the way?
     devices = bus["devices"]
-    present = sorted((d.get("slave_id"), d.get("component_instance_id"))
-                     for d in devices if d.get("vfd_model") == MODEL)
-    if present == [(slave, comp) for slave, _, comp in METERS]:
-        print("All 12 temperature meters are already in config.json. Nothing to do.")
-        return
-
-    wanted_slaves = {slave for slave, _, _ in METERS}
-    wanted_comps = {comp for _, _, comp in METERS}
-    problems = []
-    for d in devices:                               # slave ids only clash on the same bus
-        if d.get("slave_id") in wanted_slaves:
-            problems.append('slave {} on {} is already used by "{}"'.format(
-                d.get("slave_id"), BUS_PORT, d.get("name")))
-    for b in buses:                                 # component ids are global
-        for d in b.get("devices", []):
-            if d.get("component_instance_id") in wanted_comps:
-                problems.append('component id {} is already used by "{}" on {}'.format(
-                    d.get("component_instance_id"), d.get("name"), b.get("port")))
+    existing = {(d.get("slave_id"), d.get("component_instance_id"), d.get("vfd_model")) for d in devices}
+    to_add, already, problems = [], [], []
+    for slave, jet, comp in wanted:
+        if (slave, comp, MODEL) in existing:
+            already.append(jet)
+            continue
+        for d in devices:                           # slave ids only clash on the same bus
+            if d.get("slave_id") == slave:
+                problems.append('{}: slave {} on {} is already used by "{}"'.format(
+                    jet, slave, BUS_PORT, d.get("name")))
+        for b in buses:                             # component ids are global
+            for d in b.get("devices", []):
+                if d.get("component_instance_id") == comp:
+                    problems.append('{}: component id {} is already used by "{}" on {}'.format(
+                        jet, comp, d.get("name"), b.get("port")))
+        to_add.append({"name": "{} Temp".format(jet), "slave_id": slave,
+                       "vfd_model": MODEL, "component_instance_id": comp})
     if problems:
         fail("\n  " + "\n  ".join(problems))
+    skipped = ", ".join("Jet {}".format(j) for j in sorted(args.skip))
+    if not to_add:
+        print("Nothing to do: {} already in config.json{}.".format(
+            ", ".join(already) or "no meters", "; skipped " + skipped if skipped else ""))
+        return
 
     # 4. Back up, write atomically, check with the gateway's own loader.
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     backup = CONFIG + ".bak-" + stamp
     shutil.copy2(CONFIG, backup)
-    devices.extend(NEW_DEVICES)
+    devices.extend(to_add)
     tmp = CONFIG + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(config, fh, indent=2, ensure_ascii=False)
@@ -121,7 +136,13 @@ def main():
         fail("the gateway's own config check rejected the new file ({}). "
              "The old config.json was put back.".format(exc))
 
-    print("OK: added 12 temperature meters to {} (slaves 4-15 -> components 45-56).".format(BUS_PORT))
+    print("OK: added {} temperature meter(s) to {}:".format(len(to_add), BUS_PORT))
+    for d in to_add:
+        print("  {:12} slave {:>2} -> component {}".format(d["name"], d["slave_id"], d["component_instance_id"]))
+    if already:
+        print("Already there, unchanged: " + ", ".join(already))
+    if skipped:
+        print("Skipped (not on the bus): " + skipped)
     print("Backup of the old file: " + backup)
     print("Next: sudo systemctl restart gateway && tail -f gateway.log")
 
